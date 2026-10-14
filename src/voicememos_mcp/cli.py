@@ -51,13 +51,15 @@ def cmd_second_read(args) -> int:
 
         since = args.since or ("1970-01-01" if not args.memo else None)
         print(json.dumps(Tools(cfg).second_read(args.memo, since, args.until, args.model, args.redo, args.limit,
-                                                args.only_uncertain),
+                                                args.only_uncertain, args.realign),
                          indent=1))
         return 0
     summary = Worker(cfg).run_second_read(only=args.memo, since=args.since, until=args.until, limit=args.limit,
-                                          model=args.model, redo=args.redo, only_uncertain=args.only_uncertain)
+                                          model=args.model, redo=args.redo, only_uncertain=args.only_uncertain,
+                                          realign=args.realign)
     for item in summary.get("items", []):
-        agreement = (item.get("agreement") or {}).get("agreement")
+        agreement = item.get("agreement")
+        agreement = agreement.get("agreement") if isinstance(agreement, dict) else agreement
         extra = f" agreement {agreement:.2f}" if agreement is not None else f" {item.get('error') or ''}"
         print(f"{item.get('recorded', '')[:16]}  {item['short_id']}  {item['status']}{extra}  {item.get('title') or ''}")
     if not summary.get("ok"):
@@ -203,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, help="at most N memos")
     p.add_argument("--model", help="model id (default VOICEMEMOS_SECOND_READER_MODEL)")
     p.add_argument("--redo", action="store_true", help="read again even if already read")
+    p.add_argument("--realign", action="store_true",
+                   help="align the stored readings again with the current rules (no API calls)")
     p.add_argument("--only-uncertain", action="store_true",
                    help="only memos (or parts of long recordings) with low certainty")
     p.add_argument("--queue", action="store_true",

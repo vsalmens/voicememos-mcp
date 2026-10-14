@@ -272,7 +272,7 @@ class Tools:
 
     def second_read(self, memos: list[str] | None = None, since: str | None = None, until: str | None = None,
                     model: str | None = None, redo: bool = False, limit: int | None = None,
-                    only_uncertain: bool = False) -> dict:
+                    only_uncertain: bool = False, realign: bool = False) -> dict:
         memos = [m for m in (memos or []) if m and m.strip()]
         since, until = _check_date(since, "since"), _check_date(until, "until")
         if not memos and not since and not until:
@@ -281,7 +281,8 @@ class Tools:
             raise ToolError("invalid model id")
         request = {"action": "second_read", "memos": [self._find(m)["id"] for m in memos], "since": since,
                    "until": until, "model": model, "redo": bool(redo),
-                   "limit": max(1, int(limit)) if limit else None, "only_uncertain": bool(only_uncertain)}
+                   "limit": max(1, int(limit)) if limit else None, "only_uncertain": bool(only_uncertain),
+                   "realign": bool(realign)}
         self.store.ensure_dirs()
         job_id = self.store.enqueue(request)
         return {"job_id": job_id, "status": "queued", "worker": self._kick_worker(),

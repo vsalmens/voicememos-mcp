@@ -525,6 +525,52 @@ class Worker:
         self.state[memo.id] = entry
         return {**item, "status": "second_read", "agreement": record["agreement"], "markdown": result["markdown"]}
 
+    def realign_memo(self, memo: Memo) -> dict:
+        """Re-align the stored second reading with the current rules; no new API call."""
+        item = {"id": memo.id, "short_id": memo.short_id, "title": memo.title, "recorded": memo.recorded}
+        entry = self.state.get(memo.id, {})
+        data = self.store.load_transcript(entry["json"]) if entry.get("ok") else None
+        if data is None:
+            return {**item, "status": "skipped", "error": "no transcript"}
+        second = next((r for r in data.get("readers", []) if r.get("role") == "second"
+                       and (r.get("text") or r.get("chunks"))), None)
+        if second is None:
+            return {**item, "status": "skipped", "error": "no second reading"}
+        floor = float(self.cfg.get("VOICEMEMOS_SECOND_READER_MIN_AGREEMENT"))
+        primary = data.get("words", [])
+        if second.get("chunks"):
+            for chunk in second["chunks"]:
+                if chunk.get("rejected"):  # give a rejected part another look under the current floor
+                    chunk["text"] = chunk.pop("rejected_text", None)
+                    chunk.pop("rejected")
+                if chunk.get("text") is None:
+                    continue
+                _, m = align.align(primary[chunk["first"]:chunk["last"]], chunk["text"], self.cfg.threshold,
+                                   chunk.get("finish_reason") in align.TRUNCATED)
+                if m["agreement"] < floor:
+                    chunk.update(rejected_text=chunk["text"], text=None, rejected=f"agreement {m['agreement']} below {floor}")
+            words, metrics = align.align_chunks(primary, second["chunks"], self.cfg.threshold)
+            ok = metrics["chunks_read"] > 0
+        else:
+            words, metrics = align.align(primary, second["text"], self.cfg.threshold,
+                                         second.get("finish_reason") in align.TRUNCATED)
+            ok = metrics["agreement"] >= floor
+        second["agreement"] = metrics
+        if ok:
+            second.pop("error", None)
+        else:
+            words = align.strip_reader(primary)
+            second["error"] = f"rejected: agreement {metrics['agreement']} below {floor}"
+        data["words"] = words
+        result = self.store.rewrite_transcript(entry["json"], data, self.cfg.threshold, self.cfg.run_min,
+                                               self.cfg.pause_ms, self.cfg.marker_spec)
+        entry.update(stats=result["stats"], markers=result["markers"])
+        entry["second_reader"] = ({"model": second.get("model"), "agreement": metrics["agreement"],
+                                   "at": second.get("created")} if ok else
+                                  {"model": second.get("model"), "rejected": second["error"], "at": second.get("created")})
+        self.state[memo.id] = entry
+        return {**item, "status": "realigned" if ok else "rejected", "agreement": metrics["agreement"]}
+
     def _push_roam(self, memo: Memo, words: list[dict], result: dict, entry: dict, item: dict) -> None:
         graph, token = self.cfg.get("ROAM_GRAPH"), self.cfg.secret("ROAM_API_TOKEN")
         if not (graph and token and memo.recorded):
@@ -602,7 +648,7 @@ class Worker:
                 targets = [m for m in targets if self.state.get(m.id, {}).get("ok")]
             if request.get("action") == "second_read":
                 targets = [m for m in targets if self.state.get(m.id, {}).get("ok")]
-                if not request.get("redo"):
+                if not request.get("redo") and not request.get("realign"):
                     targets = [m for m in targets if not self.state[m.id].get("second_reader")]
             if request.get("limit"):
                 targets = targets[: int(request["limit"])]
@@ -613,6 +659,8 @@ class Worker:
             for memo in targets:
                 if action == "identify":
                     item = self.identify_memo(memo)
+                elif second and request.get("realign"):
+                    item = self.realign_memo(memo)
                 elif second:
                     item = self.second_read_memo(memo, request.get("model"), bool(request.get("redo")),
                                                  bool(request.get("only_uncertain")))
@@ -622,8 +670,9 @@ class Worker:
                                                              "error", "markdown")})
                 job["done"] += 1
                 job["failed"] += item["status"] == "failed"
-                if second and item.get("agreement"):
-                    job["items"][-1]["agreement"] = item["agreement"].get("agreement")
+                if second and item.get("agreement") is not None:
+                    agreement = item["agreement"]
+                    job["items"][-1]["agreement"] = agreement.get("agreement") if isinstance(agreement, dict) else agreement
                 if item.get("voiceprint"):
                     job["items"][-1]["voiceprint"] = item["voiceprint"]
                 self.store.write_job(job)
@@ -661,8 +710,10 @@ class Worker:
     # ------------------------------------------------------------------ second reader batch
     def run_second_read(self, only: list[str] | None = None, since: str | None = None, until: str | None = None,
                         limit: int | None = None, model: str | None = None, redo: bool = False,
-                        only_uncertain: bool = False) -> dict:
-        """Add the second reader to existing transcripts (synchronously, under the worker lock)."""
+                        only_uncertain: bool = False, realign: bool = False) -> dict:
+        """Add the second reader to existing transcripts (synchronously, under the worker lock).
+
+        With ``realign`` the stored readings are aligned again with the current rules instead."""
         self.store.ensure_dirs()
         try:
             with single_instance(self.store.data_dir / "worker.lock"):
@@ -674,7 +725,10 @@ class Worker:
                 for memo in targets:
                     if limit and sum(1 for i in items if i["status"] == "second_read") >= limit:
                         break
-                    items.append(self.second_read_memo(memo, model, redo, only_uncertain))
+                    if realign:
+                        items.append(self.realign_memo(memo))
+                    else:
+                        items.append(self.second_read_memo(memo, model, redo, only_uncertain))
                     self.store.write_state(self.state)
                 self.store.write_library(self._snapshot(memos))
                 return {"ok": True, "items": items}

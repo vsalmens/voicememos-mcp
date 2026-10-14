@@ -355,3 +355,21 @@ def test_one_refused_part_does_not_lose_the_others(cfg, tmp_path):
     out, record = worker._apply_second_reader(reader, audio, SimpleNamespace(id="l", duration_s=4200), words)
     assert "error" not in record and len(calls) == 2
     assert record["chunks"][0]["failed"].startswith("Gemini") and record["agreement"]["chunks_read"] == 1
+
+
+def test_realign_uses_stored_text_without_api_calls(cfg, fake):
+    Worker(cfg, transcriber=fake).run()
+    Worker(cfg, transcriber=fake, second_reader=fake_reader()).run_second_read(only=["aaaa1111"])
+    path = next(cfg.output_dir.rglob("*morning-walk_aaaa1111.json"))
+    data = json.loads(path.read_text())
+    second = [r for r in data["readers"] if r["role"] == "second"][0]
+    second["text"] = "Warm up for ten minutes. Squats: three sets of twelve."  # what a made-up reading looks like
+    path.write_text(json.dumps(data))
+
+    def no_calls(audio):
+        raise AssertionError("realign must not call the reader")
+
+    summary = Worker(cfg, transcriber=fake, second_reader=no_calls).run_second_read(only=["aaaa1111"], realign=True)
+    assert summary["items"][0]["status"] == "rejected"
+    md = next(cfg.output_dir.rglob("*morning-walk_aaaa1111.md")).read_text()
+    assert "{" not in md.split("## Transcript", 1)[1]

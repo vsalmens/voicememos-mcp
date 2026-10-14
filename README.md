@@ -203,6 +203,10 @@ words after the end of its text are left uncompared instead of being marked `{wo
 the model refuses one part of a long recording, that part stays unread and the other parts
 are kept.
 
+After such rule changes, `voicememos-mcp second-read --realign --queue` (or
+`voicememos_second_read(since="2000-01-01", realign=True)`) aligns the stored readings again
+with the current rules. No audio is sent and no API is called.
+
 Transcripts start with a short reading guide that asks language models not to present
 marked words as certain, and to propose corrections visibly (`word→suggestion (?)`).
 
