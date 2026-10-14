@@ -257,9 +257,7 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
     speakers = data.get("speakers") or {}
     if speakers:
         parts = ", ".join(f"{v['label']} {100 * v['share']:.0f} %" for v in speakers.values())
-        owner_note = (" A name followed by (?) is a guess from speaking share, not voice recognition."
-                      if any(v.get("basis") == "speaking_share" for v in speakers.values()) else "")
-        front += [f"> Speakers (share of words): {parts}.{owner_note}", ""]
+        front += [f"> Speakers (share of words): {parts}. Labels hold within this memo only.", ""]
     if not data.get("confidence_available"):
         front += ["> Warning: the engine returned no confidence values, so nothing is marked as uncertain.", ""]
     if markers:

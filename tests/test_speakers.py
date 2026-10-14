@@ -36,21 +36,10 @@ def test_speakers_numbered_and_rendered_per_turn():
         "**S1:** How are you?", "**S2:** Fine (?).", "**S1:** Good to hear."]
 
 
-def test_owner_guess_is_marked_uncertain():
-    labels = notation.speaker_labels(words(), owner_name="Alex", owner_min_share=0.6)
-    assert labels["1"]["label"] == "Alex (?)" and labels["1"]["basis"] == "speaking_share"
-    assert labels["2"]["label"] == "S2"
-    # no dominant speaker -> no owner guess
-    even = notation.speaker_labels(words()[:4], owner_name="Alex", owner_min_share=0.8)
-    assert all("Alex" not in v["label"] for v in even.values())
-
-
 def test_worker_stores_speakers_and_renders_them(cfg):
-    cfg.raw["VOICEMEMOS_OWNER_NAME"] = "Alex"
     Worker(cfg, transcriber=FakeTranscriber(tokens=CONVERSATION)).run()
     md = next(cfg.output_dir.rglob("*morning-walk_aaaa1111.md")).read_text()
-    assert "**Alex (?):** How are you?" in md and "**S2:** Fine (?)." in md
-    assert "guess from speaking share" in md
+    assert "**S1:** How are you?" in md and "**S2:** Fine (?)." in md
     data = json.loads(next(cfg.output_dir.rglob("*morning-walk_aaaa1111.json")).read_text())
     assert data["speakers"]["2"]["share"] > 0 and data["words"][0]["speaker"] == "1"
     library = json.loads((cfg.data_dir / "library.json").read_text())

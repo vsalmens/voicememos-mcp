@@ -158,12 +158,11 @@ def _with_inserts(word: dict, rendered: str) -> str:
     return " ".join(x for x in (before, rendered, after) if x)
 
 
-def speaker_labels(words: list[dict], owner_name: str = "", owner_min_share: float = 0.6) -> dict:
+def speaker_labels(words: list[dict]) -> dict:
     """Label speakers when more than one was detected; ``{}`` for single-speaker memos.
 
-    Speakers are numbered S1, S2, ... in order of appearance. With ``owner_name`` set, the
-    speaker who says at least ``owner_min_share`` of the words is shown as ``"<owner> (?)"``:
-    a guess from speaking share, marked like any other uncertain reading.
+    Speakers are numbered S1, S2, ... in order of appearance. The labels only hold within
+    one memo; nobody is named.
     """
     counts: dict[str, int] = {}
     order: list[str] = []
@@ -179,16 +178,8 @@ def speaker_labels(words: list[dict], owner_name: str = "", owner_min_share: flo
     if len(order) < 2:
         return {}
     total = sum(counts.values())
-    labels = {}
-    top = max(order, key=lambda k: counts[k])
-    for number, spk in enumerate(order, start=1):
-        share = counts[spk] / total
-        if owner_name and spk == top and share >= owner_min_share:
-            labels[spk] = {"label": f"{owner_name} (?)", "words": counts[spk], "share": round(share, 3),
-                           "basis": "speaking_share"}
-        else:
-            labels[spk] = {"label": f"S{number}", "words": counts[spk], "share": round(share, 3)}
-    return labels
+    return {spk: {"label": f"S{number}", "words": counts[spk], "share": round(counts[spk] / total, 3)}
+            for number, spk in enumerate(order, start=1)}
 
 
 def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_ms: int = 2500,

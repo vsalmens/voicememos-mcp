@@ -207,7 +207,7 @@ class Worker:
                 reader = None if dry_run else self.second_reader()
                 if reader is not None:
                     words, second_record = self._apply_second_reader(reader, audio, memo, words)
-            speakers = notation.speaker_labels(words, self.cfg.owner_name, self.cfg.owner_min_share)
+            speakers = notation.speaker_labels(words)
             if dry_run:
                 text = "\n\n".join(notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min,
                                                           self.cfg.pause_ms, speakers))
@@ -291,8 +291,7 @@ class Worker:
             return
         try:
             blocks = notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min, self.cfg.pause_ms,
-                                            notation.speaker_labels(words, self.cfg.owner_name,
-                                                                    self.cfg.owner_min_share))
+                                            notation.speaker_labels(words))
             parent = roam.heading(self.cfg.get("VOICEMEMOS_ROAM_HEADING"), memo.to_dict(),
                                   notation.stats_line(result["stats"]))
             roam.append_daily_note(graph, token, dt.date.fromisoformat(memo.recorded[:10]), parent,
