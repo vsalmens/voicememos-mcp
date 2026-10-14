@@ -11,11 +11,15 @@
 #   --interval SEC     launchd: also run every SEC seconds
 #   --log-dir DIR      launchd: stdout/stderr logs (default: ~/Library/Logs/NAME)
 #
-# Set FDA_LAUNCHER_NO_LOAD=1 to write the plist without loading it.
+# Environment:
+#   FDA_LAUNCHER_NO_LOAD=1             write the plist without loading it
+#   FDA_LAUNCHER_SIGN_IDENTITY=NAME    sign with this code signing identity from the Keychain
+#                                      instead of ad hoc, so grants survive rebuilds (see README).
+#                                      Remembered next to the launcher; "-" switches back to ad hoc.
 #
-# The launcher is rebuilt only when launcher.c or the command changes, so an existing
-# privacy grant (Full Disk Access) stays valid across updates. The last line printed to
-# stdout is the launcher path; messages go to stderr.
+# The launcher is rebuilt only when launcher.c, the command or the signing identity changes,
+# so an existing privacy grant (Full Disk Access) stays valid across updates. The last line
+# printed to stdout is the launcher path; messages go to stderr.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)/launcher.c"
@@ -51,17 +55,43 @@ for arg in "$@"; do
   ARGV_C+="${ARGV_C:+,}\"$escaped\""
 done
 
+# Signing identity: from the environment, else the one used for the previous build.
+ID_FILE="$OUT.sign-identity"
+SIGN_ID="${FDA_LAUNCHER_SIGN_IDENTITY:-}"
+if [ -z "$SIGN_ID" ] && [ -f "$ID_FILE" ]; then SIGN_ID="$(cat "$ID_FILE")"; fi
+[ "$SIGN_ID" != "-" ] || SIGN_ID=""
+case "$SIGN_ID" in *$'\n'*) echo "invalid signing identity" >&2; exit 2 ;; esac
+
 STAMP="$OUT.stamp"
-WANT="$( { cat "$SRC"; printf '%s\0' "$@"; } | shasum -a 256 | cut -d' ' -f1)"
+WANT="$( { cat "$SRC"; printf '%s\0' "$@"; [ -z "$SIGN_ID" ] || printf 'sign:%s\0' "$SIGN_ID"; } \
+  | shasum -a 256 | cut -d' ' -f1)"
 if [ -x "$OUT" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$WANT" ]; then
   echo "launcher unchanged: existing permission grants stay valid" >&2
 else
   command -v cc >/dev/null || { echo "no C compiler; install it with: xcode-select --install" >&2; exit 1; }
   mkdir -p "$(dirname "$OUT")"
+  rm -f "$OUT.tmp"
   cc -O2 -Wall -o "$OUT.tmp" "-DLAUNCH_ARGV=$ARGV_C" "$SRC"
+  if [ -n "$SIGN_ID" ]; then
+    # A fixed identifier plus a certificate gives a designated requirement that does not
+    # depend on the binary's hash, so the grant carries over to the rebuilt launcher.
+    if ! command -v codesign >/dev/null \
+       || ! codesign --force --sign "$SIGN_ID" --identifier "local.fda-launcher.$NAME" "$OUT.tmp"; then
+      rm -f "$OUT.tmp"
+      echo "signing with identity \"$SIGN_ID\" failed; the existing launcher was left unchanged" >&2
+      echo "(create the certificate first, see README; or set FDA_LAUNCHER_SIGN_IDENTITY=- for ad hoc)" >&2
+      exit 1
+    fi
+  fi
   mv "$OUT.tmp" "$OUT"
   echo "$WANT" > "$STAMP"
-  echo "launcher built: grant it Full Disk Access (System Settings > Privacy & Security), then restart the job" >&2
+  if [ -n "$SIGN_ID" ]; then echo "$SIGN_ID" > "$ID_FILE"; else rm -f "$ID_FILE"; fi
+  if [ -n "$SIGN_ID" ]; then
+    echo "launcher built and signed with \"$SIGN_ID\": a grant made to a launcher signed with this" >&2
+    echo "identity stays valid; otherwise grant Full Disk Access once and restart the job" >&2
+  else
+    echo "launcher built: grant it Full Disk Access (System Settings > Privacy & Security), then restart the job" >&2
+  fi
 fi
 
 if [ -n "$LABEL" ]; then

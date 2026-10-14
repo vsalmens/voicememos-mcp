@@ -66,10 +66,15 @@ WORKER_PY="$WORKER_VENV/bin/python"
 echo "  $WORKER_PY"
 
 # Fixed-command launcher (launcher/, same as the fda-launcher template): rebuilt only when its
-# source or the command changes, so the binary and its Full Disk Access grant survive updates.
+# source, the command or the signing identity changes, so the binary and its Full Disk Access
+# grant survive updates. FDA_LAUNCHER_SIGN_IDENTITY (optional) is passed through.
 LAUNCHER="$DATA_DIR/bin/voicememos-worker"
 if "$SRC_DIR/launcher/build-launcher.sh" --name voicememos-mcp --out "$LAUNCHER" \
      -- "$WORKER_PY" -m voicememos_mcp sync >/dev/null; then
+  FDA_TARGET="$LAUNCHER"
+elif [ -x "$LAUNCHER" ]; then
+  # Never fall back to the interpreter while a working launcher exists: its grant would be lost.
+  echo "  launcher not rebuilt (see the message above); keeping the existing one."
   FDA_TARGET="$LAUNCHER"
 else
   echo "  no launcher (needs a C compiler: xcode-select --install); falling back to the interpreter."

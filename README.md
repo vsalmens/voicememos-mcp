@@ -172,6 +172,11 @@ Why a launcher:
 * `install.sh` rebuilds it only when its source or the worker path changes, so the grant
   survives updates. Without a C compiler (`xcode-select --install`) the installer falls back
   to granting the interpreter.
+* To keep the grant even when the launcher has to be rebuilt, sign it with your own
+  certificate: run `FDA_LAUNCHER_SIGN_IDENTITY="<certificate name>" ./install.sh` once and
+  grant the permission one last time. Later installs reuse the identity. How to create the
+  certificate, and what it means for security, is in the
+  [fda-launcher template](https://github.com/vsalmens/fda-launcher#keeping-the-grant-across-rebuilds-optional).
 
 The MCP server does not need Full Disk Access. Do not grant it to Claude Desktop: every
 local MCP server it starts would inherit it.
