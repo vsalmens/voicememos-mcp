@@ -79,6 +79,14 @@ class Store:
         return self.data_dir / "worker.json"
 
     @property
+    def voiceprint_path(self) -> Path:
+        return self.data_dir / "voiceprint.json"
+
+    @property
+    def models_dir(self) -> Path:
+        return self.data_dir / "models"
+
+    @property
     def queue_dir(self) -> Path:
         return self.data_dir / "queue"
 
@@ -255,9 +263,19 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
                   f"{100 * agreement:.0f} %. `{{a|b}}` shows where the engines differ." if agreement is not None
                   else f"> Second reader: {second.get('model')}.", ""]
     speakers = data.get("speakers") or {}
+    voice = data.get("voiceprint") or {}
     if speakers:
         parts = ", ".join(f"{v['label']} {100 * v['share']:.0f} %" for v in speakers.values())
-        front += [f"> Speakers (share of words): {parts}. Labels hold within this memo only.", ""]
+        note = " S-labels hold within this memo only."
+        if any(v.get("basis") == "voiceprint" for v in speakers.values()):
+            scored = ", ".join(f"{v['label']} {v['voiceprint']:.2f}" for v in speakers.values()
+                               if v.get("voiceprint") is not None)
+            note += f" The name comes from a voiceprint match (similarity: {scored}); (?) = possible match."
+        front += [f"> Speakers (share of words): {parts}.{note}", ""]
+    elif voice.get("score") is not None:
+        verdict = {"match": f"matches {voice['name']}", "possible": f"possibly {voice['name']} (?)",
+                   "no match": f"does not match {voice['name']}"}.get(voice.get("result"), voice.get("result"))
+        front += [f"> Voiceprint: {verdict} (similarity {voice['score']:.2f}).", ""]
     if not data.get("confidence_available"):
         front += ["> Warning: the engine returned no confidence values, so nothing is marked as uncertain.", ""]
     if markers:

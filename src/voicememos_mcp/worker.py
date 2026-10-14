@@ -80,6 +80,17 @@ def gemini_reader(cfg: Config, model: str | None = None) -> SecondReader:
     return read
 
 
+def _vp_short(summary: dict | None) -> dict | None:
+    if not summary:
+        return None
+    short = {"result": summary.get("result")}
+    if summary.get("score") is not None:
+        short["score"] = summary["score"]
+    if summary.get("speaker") is not None:
+        short["speaker"] = summary["speaker"]
+    return short
+
+
 def _fingerprint(path: Path) -> str:
     st = path.stat()
     return f"{st.st_size}:{int(st.st_mtime)}"
@@ -97,11 +108,13 @@ def _in_range(memo: Memo, since: str | None, until: str | None) -> bool:
 class Worker:
     def __init__(self, cfg: Config, store: Store | None = None, transcriber: Transcriber | None = None,
                  roam_session=None, clock: Callable[[], float] = time.time,
-                 second_reader: SecondReader | None = None):
+                 second_reader: SecondReader | None = None, embedder=None, audio_loader=None):
         self.cfg = cfg
         self.store = store or Store(cfg.data_dir, cfg.output_dir)
         self._transcriber = transcriber
         self._second_reader = second_reader
+        self._embedder = embedder
+        self._audio_loader = audio_loader
         self.roam_session = roam_session
         self.clock = clock
         self.state: dict = {}
@@ -143,6 +156,94 @@ class Worker:
             record["error"] = str(exc)[:300]
             return words, record
 
+    # ------------------------------------------------------------------ voiceprint
+    def embedder(self):
+        if isinstance(self._embedder, Exception):  # failed earlier in this run: do not retry per memo
+            raise RuntimeError(f"voiceprint model unavailable: {self._embedder}")
+        if self._embedder is None:
+            from .voiceprint import SherpaEmbedder, ensure_model
+
+            try:
+                model = self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL")
+                self._embedder = SherpaEmbedder(ensure_model(self.store.models_dir, model))
+            except Exception as exc:
+                self._embedder = exc
+                raise
+        return self._embedder
+
+    def load_audio(self, path: Path):
+        if self._audio_loader is not None:
+            return self._audio_loader(path)
+        from .voiceprint import load_audio
+
+        return load_audio(path)
+
+    def _identify(self, audio: Path, words: list[dict], speakers: dict) -> tuple[dict, dict | None]:
+        """Apply the voiceprint if one is enrolled. Never raises."""
+        from .voiceprint import Voiceprint, identify
+
+        voiceprint = Voiceprint(self.store.voiceprint_path).load()
+        if not voiceprint:
+            return speakers, None
+        try:
+            return identify(self.load_audio(audio), words, speakers, voiceprint, self.embedder())
+        except Exception as exc:  # noqa: BLE001 - the transcript must survive
+            log.exception("Voiceprint identification failed")
+            return speakers, {"name": voiceprint.get("name"), "result": "error", "error": str(exc)[:200]}
+
+    def enroll_voiceprint(self, memos: list[Memo], name: str) -> dict:
+        from .voiceprint import Voiceprint, enroll
+
+        if not name:
+            raise RuntimeError("no name given (set VOICEMEMOS_VOICEPRINT_NAME or pass a name)")
+        samples, words = {}, {}
+        with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+            for memo in memos:
+                if not memo.local or not memo.filename:
+                    raise RuntimeError(f"memo {memo.short_id} is not downloaded")
+                samples[memo.id] = self.load_audio(prepare_audio(self.cfg.recordings_dir / memo.filename, Path(tmp)))
+                entry = self.state.get(memo.id, {})
+                data = self.store.load_transcript(entry["json"]) if entry.get("ok") else None
+                if data and data.get("speakers"):
+                    raise RuntimeError(f"memo {memo.short_id} has {len(data['speakers'])} speakers; "
+                                       "enroll only memos where you speak alone")
+                if data:
+                    words[memo.id] = data.get("words", [])
+        result = enroll(name, self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL"), samples, self.embedder(), words)
+        Voiceprint(self.store.voiceprint_path).save(result)
+        return Voiceprint(self.store.voiceprint_path).summary()
+
+    def identify_memo(self, memo: Memo) -> dict:
+        """Apply the voiceprint to an existing transcript (no new transcription)."""
+        item = {"id": memo.id, "short_id": memo.short_id, "title": memo.title, "recorded": memo.recorded}
+        entry = self.state.get(memo.id, {})
+        if not entry.get("ok"):
+            return {**item, "status": "not_transcribed"}
+        if not memo.local or not memo.filename:
+            return {**item, "status": "not_downloaded"}
+        try:
+            data = self.store.load_transcript(entry["json"])
+            if data is None:
+                return {**item, "status": "failed", "error": "transcript file missing"}
+            words = data.get("words", [])
+            with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+                audio = prepare_audio(self.cfg.recordings_dir / memo.filename, Path(tmp))
+                speakers, summary = self._identify(audio, words, notation.speaker_labels(words))
+            if summary is None:
+                return {**item, "status": "failed", "error": "no voiceprint enrolled"}
+            if summary.get("result") == "error":
+                return {**item, "status": "failed", "error": summary.get("error")}
+            data["speakers"], data["voiceprint"] = speakers, summary
+            result = self.store.rewrite_transcript(entry["json"], data, self.cfg.threshold, self.cfg.run_min,
+                                                   self.cfg.pause_ms, self.cfg.markers)
+        except Exception as exc:  # noqa: BLE001 - a failing memo must not block the queue
+            log.exception("Voiceprint identification failed for %s", memo.id)
+            return {**item, "status": "failed", "error": str(exc)[:300]}
+        entry.update(stats=result["stats"], markers=result["markers"], speakers=len(speakers),
+                     voiceprint=_vp_short(summary))
+        self.state[memo.id] = entry
+        return {**item, "status": "identified", "voiceprint": _vp_short(summary)}
+
     def _excluded(self, memo: Memo) -> bool:
         return is_excluded(memo, self.cfg.exclude_title_regex, self.cfg.exclude_folders)
 
@@ -173,7 +274,8 @@ class Worker:
             item["status"] = self._status(memo)
             if entry.get("ok"):
                 item["transcript"] = {k: entry.get(k) for k in ("json", "markdown", "stats", "markers", "at",
-                                                                "language", "second_reader", "speakers")}
+                                                                "language", "second_reader", "speakers",
+                                                                "voiceprint")}
             elif entry.get("error"):
                 item["error"] = entry["error"]
             items.append(item)
@@ -207,7 +309,10 @@ class Worker:
                 reader = None if dry_run else self.second_reader()
                 if reader is not None:
                     words, second_record = self._apply_second_reader(reader, audio, memo, words)
-            speakers = notation.speaker_labels(words)
+                speakers = notation.speaker_labels(words)
+                voice = None
+                if not dry_run:
+                    speakers, voice = self._identify(audio, words, speakers)
             if dry_run:
                 text = "\n\n".join(notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min,
                                                           self.cfg.pause_ms, speakers))
@@ -215,7 +320,7 @@ class Worker:
                         "text": text, "confidence_available": had_confidence}
             engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
                       "language_hints": self.cfg.languages}
-            extra = {"language": align.dominant_language(words), "speakers": speakers,
+            extra = {"language": align.dominant_language(words), "speakers": speakers, "voiceprint": voice,
                      "readers": [{"role": "primary", **engine, "created": now_iso()}]
                      + ([second_record] if second_record else [])}
             result = self.store.write_transcript(
@@ -224,6 +329,8 @@ class Worker:
             )
             result["language"] = extra["language"]
             result["speakers"] = len(speakers)
+            if voice:
+                result["voiceprint"] = _vp_short(voice)
             if second_record and not second_record.get("error"):
                 result["second_reader"] = {"model": second_record.get("model"),
                                            "agreement": second_record["agreement"]["agreement"]}
@@ -322,12 +429,36 @@ class Worker:
         selected.sort(key=lambda m: m.recorded or "")
         return selected
 
+    def _run_enroll_job(self, job: dict, request: dict, memos: list[Memo]) -> None:
+        job.update(status="running", started=now_iso())
+        self.store.write_job(job)
+        targets = self._resolve_request({"memos": request.get("memos") or []}, memos)
+        try:
+            if len(targets) != len(request.get("memos") or []):
+                raise RuntimeError("some memos were not found (excluded, deleted or unknown)")
+            job["voiceprint"] = self.enroll_voiceprint(targets, request.get("name")
+                                                       or self.cfg.get("VOICEMEMOS_VOICEPRINT_NAME"))
+            job["status"] = "done"
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Voiceprint enrollment failed")
+            job.update(status="failed", error=str(exc)[:300])
+        job["finished"] = now_iso()
+        self.store.write_job(job)
+        self.store.finish_request(job["job_id"])
+
     def process_queue(self, memos: list[Memo]) -> list[dict]:
         jobs = []
         for request_doc in self.store.pending_requests():
             job = self.store.read_job(request_doc["job_id"]) or request_doc
             request = job.get("request", {})
+            action = request.get("action")
+            if action == "enroll":
+                self._run_enroll_job(job, request, memos)
+                jobs.append(job)
+                continue
             targets = self._resolve_request(request, memos)
+            if action == "identify":
+                targets = [m for m in targets if self.state.get(m.id, {}).get("ok")]
             if request.get("action") == "second_read":
                 targets = [m for m in targets if self.state.get(m.id, {}).get("ok")]
                 if not request.get("redo"):
@@ -339,7 +470,9 @@ class Worker:
             push = bool(request.get("push_roam")) or self.cfg.flag("VOICEMEMOS_ROAM_BACKFILL")
             second = request.get("action") == "second_read"
             for memo in targets:
-                if second:
+                if action == "identify":
+                    item = self.identify_memo(memo)
+                elif second:
                     item = self.second_read_memo(memo, request.get("model"), bool(request.get("redo")))
                 else:
                     item = self.transcribe_memo(memo, force=bool(request.get("redo")), push_roam=push)
@@ -349,6 +482,8 @@ class Worker:
                 job["failed"] += item["status"] == "failed"
                 if second and item.get("agreement"):
                     job["items"][-1]["agreement"] = item["agreement"].get("agreement")
+                if item.get("voiceprint"):
+                    job["items"][-1]["voiceprint"] = item["voiceprint"]
                 self.store.write_job(job)
                 self.store.write_state(self.state)
             job.update(status="done", finished=now_iso())

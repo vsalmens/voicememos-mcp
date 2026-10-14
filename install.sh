@@ -60,7 +60,8 @@ echo "  $SERVER_BIN ($("$SERVER_BIN" --version))"
 echo "== 3/6 worker environment"
 WORKER_VENV="$DATA_DIR/worker-venv"
 uv venv --allow-existing --python "$WORKER_PYTHON_VERSION" "$WORKER_VENV" >/dev/null
-uv pip install --python "$WORKER_VENV/bin/python" --reinstall "$SRC_DIR" >/dev/null
+# The worker also gets the optional voiceprint dependencies (local speaker model, no torch).
+uv pip install --python "$WORKER_VENV/bin/python" --reinstall "$SRC_DIR[voiceprint]" >/dev/null
 WORKER_PY="$WORKER_VENV/bin/python"
 echo "  $WORKER_PY"
 

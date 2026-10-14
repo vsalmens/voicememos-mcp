@@ -51,6 +51,8 @@ DEFAULTS: dict[str, str] = {
     "SONIOX_BASE_URL": "https://api.soniox.com",
     "SONIOX_MODEL": "stt-async-v5",
     "VOICEMEMOS_DIARIZATION": "1",
+    "VOICEMEMOS_VOICEPRINT_NAME": "",
+    "VOICEMEMOS_VOICEPRINT_MODEL": "wespeaker_en_voxceleb_resnet34_LM",
     "VOICEMEMOS_SECOND_READER": "",
     "VOICEMEMOS_SECOND_READER_MODEL": "gemini-4-argon",
     "VOICEMEMOS_SECOND_READER_MAX_MIN": "60",

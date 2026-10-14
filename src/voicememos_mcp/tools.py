@@ -51,6 +51,7 @@ def _summary(memo: dict) -> dict:
         "marked_share": stats.get("marked_share"),
         "markers": len(transcript.get("markers") or []),
         "speakers": transcript.get("speakers") or None,
+        "voiceprint": transcript.get("voiceprint") or None,
     }
 
 
@@ -266,6 +267,43 @@ class Tools:
                    for lang, group in report["languages"].items()}
         return {"languages": summary, "report_file": paths["markdown"],
                 "samples": {lang: group["samples"][:5] for lang, group in report["languages"].items()}}
+
+    def voiceprint(self, action: str = "status", memos: list[str] | None = None, since: str | None = None,
+                   until: str | None = None, name: str | None = None) -> dict:
+        from .voiceprint import Voiceprint, suggest_enrollment
+
+        if action == "status":
+            summary = Voiceprint(self.store.voiceprint_path).summary()
+            summary["configured_name"] = self.cfg.get("VOICEMEMOS_VOICEPRINT_NAME") or None
+            summary["enrollment_suggestions"] = [_summary(m) for m in suggest_enrollment(self._memos())]
+            summary["hint"] = ("enroll 4-6 memos where only you speak, from different years and places; "
+                               "listen to them first if unsure")
+            return summary
+        memos = [m for m in (memos or []) if m and m.strip()]
+        if action == "enroll":
+            if len(memos) < 2:
+                raise ToolError("give at least 2 memo ids (4-6 is better)")
+            who = (name or self.cfg.get("VOICEMEMOS_VOICEPRINT_NAME") or "").strip()
+            if not who or len(who) > 60:
+                raise ToolError("give a name (or set VOICEMEMOS_VOICEPRINT_NAME)")
+            ids = list(dict.fromkeys(self._find(m)["id"] for m in memos))
+            if len(ids) < 2:
+                raise ToolError("give at least 2 different memos")
+            request = {"action": "enroll", "memos": ids, "name": who}
+        elif action == "identify":
+            since, until = _check_date(since, "since"), _check_date(until, "until")
+            if not memos and not since and not until:
+                raise ToolError("give memo ids, or a date range (since/until)")
+            if not self.store.voiceprint_path.exists():
+                raise ToolError("no voiceprint enrolled yet (action='enroll')")
+            request = {"action": "identify", "memos": [self._find(m)["id"] for m in memos],
+                       "since": since, "until": until}
+        else:
+            raise ToolError("action must be 'status', 'enroll' or 'identify'")
+        self.store.ensure_dirs()
+        job_id = self.store.enqueue(request)
+        return {"job_id": job_id, "status": "queued", "worker": self._kick_worker(),
+                "hint": "check progress with voicememos_transcribe_status"}
 
     def _kick_worker(self) -> str:
         mode = self.cfg.get("VOICEMEMOS_WORKER")

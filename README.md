@@ -72,6 +72,36 @@ Speakers are numbered in order of appearance; the labels only hold within one me
 is named. The JSON keeps per-speaker word counts and shares (`speakers`) and the speaker of
 every word.
 
+## Voiceprint (optional)
+
+To show your name instead of `S1`, the worker can recognise your voice locally. A small
+speaker model ([WeSpeaker](https://github.com/wenet-e2e/wespeaker) ResNet34 trained on
+VoxCeleb, run with [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx); about 26 MB,
+downloaded once and checked against a pinned SHA-256) turns speech into an embedding; your
+voiceprint is the average embedding of a few memos where only you speak.
+
+1. `voicememos_voiceprint(action="status")` suggests enrollment memos: transcribed with
+   diarization, one speaker, 30 s to 15 min, spread over the years. Check that only you
+   speak in them.
+2. `voicememos_voiceprint(action="enroll", memos=[...], name="...")` (4-6 memos from
+   different years, devices and places). Enrollment scores each memo against a voiceprint
+   built from the others; the lowest score sets the match threshold, so it reflects how much
+   your own voice varies between recordings.
+3. New memos are identified as they are transcribed; `action="identify"` applies the
+   voiceprint to existing transcripts.
+
+Labels: your name when a speaker's similarity reaches the match threshold and is clearly above
+any other speaker; `Name (?)` for a possible match; otherwise `S1`, `S2`. Single-speaker
+memos get a header line ("Voiceprint: matches Name (similarity 0.93)"). Scores are kept in
+the JSON (`speakers[...].voiceprint`, `voiceprint`).
+
+Cost: about 30 seconds of speech per speaker is embedded, so identification takes roughly a
+second per memo regardless of its length.
+
+The voiceprint is biometric data. It is stored only in `DATA_DIR/voiceprint.json` (file mode
+600), never in transcripts, and the MCP tools report only a summary. Delete that file to
+remove it.
+
 ## Second reader
 
 Gemini models return text without word confidence, so they cannot drive the `(?)` marks.
@@ -166,6 +196,7 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
 | `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence |
 | `VOICEMEMOS_DIARIZATION` | `1` | separate speakers in conversations |
+| `VOICEMEMOS_VOICEPRINT_NAME` | | your name, shown when the voiceprint recognises you |
 | `VOICEMEMOS_SECOND_READER` | | `gemini` = second reading for every new memo |
 | `VOICEMEMOS_SECOND_READER_MODEL` | `gemini-4-argon` | |
 | `VOICEMEMOS_ROAM_ENABLED` | `0` | append new transcripts to Roam daily notes |
@@ -185,6 +216,7 @@ titles.
 | `voicememos_transcribe` | queue memos (by id or date range) for background transcription; returns a job id |
 | `voicememos_second_read` | queue an independent Gemini reading of transcribed memos |
 | `voicememos_compare_readers` | per-language comparison of the readers, with a listening checklist |
+| `voicememos_voiceprint` | voiceprint status and enrollment suggestions, enroll, identify |
 | `voicememos_transcribe_status` | job progress, or recent jobs |
 
 Memo status values: `transcribed`, `pending` (will be transcribed automatically),
@@ -201,6 +233,7 @@ voicememos-mcp sync --memo 1a2b3c4d --redo   # transcribe one memo again
 voicememos-mcp transcribe-file memo.m4a --threshold 0.6 --threshold 0.8   # calibration
 voicememos-mcp second-read --since 2026-01-01 --limit 20   # add the second reader
 voicememos-mcp report                        # compare readers per language
+voicememos-mcp voiceprint status             # enrollment state and suggestions
 voicememos-mcp launchd-plist                 # print the launchd job definition
 ```
 
@@ -239,7 +272,6 @@ transcripts without new API calls.
 ## Roadmap
 
 * Adjudication: a third pass that listens to the disputed segment and picks a reading.
-* Identifying the memo owner by voice (speaker embeddings compared with reference recordings).
 * Export to TEI (spoken text) and WebVTT.
 
 ## Development

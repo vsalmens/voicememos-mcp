@@ -142,6 +142,23 @@ def build_server(tools: Tools | None = None):
         return call(tools.compare_readers, since, until, samples)
 
     @server.tool()
+    def voicememos_voiceprint(action: str = "status", memos: Optional[list[str]] = None,
+                              since: Optional[str] = None, until: Optional[str] = None,
+                              name: Optional[str] = None) -> dict:
+        """Recognise the owner's voice with a local voiceprint.
+
+        Args:
+            action: 'status' (enrollment state, thresholds and suggested enrollment memos),
+                'enroll' (build the voiceprint from memos where only the owner speaks) or
+                'identify' (apply it to already transcribed memos).
+            memos: memo ids for 'enroll' (2+, ideally 4-6 from different years) or 'identify'.
+            since: for 'identify': memos recorded on or after this date (YYYY-MM-DD).
+            until: for 'identify': memos recorded on or before this date (YYYY-MM-DD).
+            name: name to show for the owner (default from config).
+        """
+        return call(tools.voiceprint, action, memos, since, until, name)
+
+    @server.tool()
     def voicememos_transcribe_status(job_id: Optional[str] = None) -> dict:
         """Progress of a transcription job, or the 10 most recent jobs when job_id is omitted."""
         return call(tools.transcribe_status, job_id)

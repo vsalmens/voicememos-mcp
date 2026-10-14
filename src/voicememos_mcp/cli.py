@@ -76,6 +76,19 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_voiceprint(args) -> int:
+    from .tools import ToolError, Tools
+
+    cfg = load_config()
+    try:
+        result = Tools(cfg).voiceprint(args.action, args.memo, args.since, args.until, args.name)
+    except ToolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=1))
+    return 0
+
+
 def cmd_check(_args) -> int:
     cfg = load_config()
     ok = True
@@ -192,6 +205,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--queue", action="store_true",
                    help="hand the request to the launchd worker (use when this shell lacks Full Disk Access)")
 
+    p = sub.add_parser("voiceprint", help="status, enroll or identify the owner's voice (enroll/identify run in the worker)")
+    p.add_argument("action", choices=["status", "enroll", "identify"])
+    p.add_argument("--memo", action="append", help="memo id (repeatable)")
+    p.add_argument("--since")
+    p.add_argument("--until")
+    p.add_argument("--name", help="name to show for the owner")
+
     p = sub.add_parser("report", help="compare the readers, per language; writes OUTPUT_DIR/_reports/")
     p.add_argument("--since")
     p.add_argument("--until")
@@ -213,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         logging.getLogger(__name__).warning("Voice Memos is a macOS app; only transcripts can be served here")
     handlers = {None: cmd_serve, "serve": cmd_serve, "sync": cmd_sync, "check": cmd_check,
                 "transcribe-file": cmd_transcribe_file, "launchd-plist": cmd_launchd_plist,
-                "second-read": cmd_second_read, "report": cmd_report}
+                "second-read": cmd_second_read, "report": cmd_report, "voiceprint": cmd_voiceprint}
     return handlers[args.command](args)
 
 

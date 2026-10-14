@@ -27,6 +27,8 @@ if path.exists():
 PY
 
 echo "Kept: $CONFIG, transcripts and state."
+echo "Your voiceprint (biometric) is kept in $DATA_DIR/voiceprint.json; delete it with:"
+echo "  rm \"$DATA_DIR/voiceprint.json\"; rm -rf \"$DATA_DIR/models\""
 echo "Remove secrets: security delete-generic-password -s voicememos-mcp -a SONIOX_API_KEY"
 echo "                security delete-generic-password -s voicememos-mcp -a ROAM_API_TOKEN"
 echo "Remove voicememos-worker from System Settings > Privacy & Security > Full Disk Access."
