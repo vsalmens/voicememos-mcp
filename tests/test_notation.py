@@ -70,3 +70,43 @@ def test_markers_with_custom_spoken_words():
     assert {"label": "Idea", "text": "visit the café"} in found
     assert {"label": "Remember", "text": "call (?) the garage tomorrow"} in found
     assert len(found) == 2  # "Task ok" is too short
+
+
+def spoken(text, low=()):
+    return [{"text": t, "conf": 0.4 if i in low else 0.99, "start_ms": i * 400, "end_ms": i * 400 + 300}
+            for i, t in enumerate(text.split())]
+
+
+SPEC = notation.MarkerSpec(kinds={"idea*": "Idea", "kysymy*": "Kysymys", "tehtäv*": "Tehtävä"},
+                           wake=["sanel*"], end=["loppu*"])
+
+
+def test_wake_word_required_and_one_sentence_by_default():
+    ws = spoken("Ajoin kotiin. Idea: tämä ei ole merkintä. Sanele idea, osta maitoa. Sitten muuta.")
+    found = notation.extract_markers("", SPEC, ws, 0.7)
+    assert [(m["label"], m["text"]) for m in found] == [("Idea", "osta maitoa")]
+    assert found[0]["start_ms"] == 7 * 400 and "uncertain_trigger" not in found[0]
+
+
+def test_inflection_punctuation_pause_and_end_phrase():
+    ws = spoken("Sanele. Kysymyksen: miksi on mitään? Ja toinen lause. Sanele loppu. Tämä jää pois.")
+    found = notation.extract_markers("", SPEC, ws, 0.7)
+    assert found == [{"label": "Kysymys", "text": "miksi on mitään? Ja toinen lause.", "start_ms": 0,
+                      "ended_by_phrase": True}]
+
+
+def test_marker_word_ending_a_sentence_takes_the_next_sentence():
+    ws = spoken("Sanele tehtävä. Soita Pentille huomenna. Muuta.")
+    assert notation.extract_markers("", SPEC, ws, 0.7)[0]["text"] == "Soita Pentille huomenna"
+
+
+def test_low_confidence_trigger_is_flagged_not_dropped():
+    ws = spoken("Sanelen idean: rakenna lintulauta.", low={0})
+    found = notation.extract_markers("", SPEC, ws, 0.7)
+    assert found[0]["uncertain_trigger"] is True and found[0]["text"] == "rakenna lintulauta"
+
+
+def test_next_marker_stops_the_previous_one():
+    ws = spoken("Sanele idea yksi asia ilman pistettä sanele tehtävä toinen asia.")
+    found = notation.extract_markers("", SPEC, ws, 0.7)
+    assert [m["text"] for m in found] == ["yksi asia ilman pistettä", "toinen asia"]

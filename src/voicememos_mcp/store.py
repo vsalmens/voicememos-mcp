@@ -127,7 +127,7 @@ class Store:
         return self.output_dir / f"{when:%Y}" / name
 
     def write_transcript(self, memo: dict, words: list[dict], engine: dict, had_confidence: bool,
-                         threshold: float, run_min: int, pause_ms: int, markers: dict[str, str],
+                         threshold: float, run_min: int, pause_ms: int, markers,
                          source_tokens: list[dict] | None = None, extra: dict | None = None) -> dict:
         """Write the JSON (canonical) and Markdown (rendered) files. Returns relative paths.
 
@@ -145,7 +145,7 @@ class Store:
             "confidence_available": had_confidence,
             "created": now_iso(),
             "stats": notation.stats(words, threshold),
-            "markers": notation.extract_markers(text, markers),
+            "markers": notation.extract_markers(text, markers, words, threshold),
             "words": notation.annotate(words, threshold),
         }
         if extra:
@@ -168,7 +168,7 @@ class Store:
         }
 
     def rewrite_transcript(self, relative_json: str, data: dict, threshold: float, run_min: int,
-                           pause_ms: int, markers: dict[str, str]) -> dict:
+                           pause_ms: int, markers) -> dict:
         """Re-derive stats, markers and flags from ``data["words"]`` and rewrite both files in place."""
         json_path = (self.output_dir / relative_json).resolve()
         if self.output_dir.resolve() not in json_path.parents:
@@ -176,7 +176,7 @@ class Store:
         words = data.get("words", [])
         text = "\n\n".join(notation.render_blocks(words, threshold, run_min, pause_ms, data.get("speakers")))
         data["stats"] = notation.stats(words, threshold)
-        data["markers"] = notation.extract_markers(text, markers)
+        data["markers"] = notation.extract_markers(text, markers, words, threshold)
         data["words"] = notation.annotate(words, threshold)
         data["updated"] = now_iso()
         write_json_atomic(json_path, data)
@@ -282,6 +282,7 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
     if not data.get("confidence_available"):
         front += ["> Warning: the engine returned no confidence values, so nothing is marked as uncertain.", ""]
     if markers:
-        front += ["## Markers", ""] + [f"- **{m['label']}:** {m['text']}" for m in markers] + [""]
+        front += ["## Markers", ""] + [f"- **{m['label']}{' (?)' if m.get('uncertain_trigger') else ''}:** {m['text']}"
+                                      for m in markers] + [""]
     front += ["## Transcript", "", text or "(no speech recognised)", ""]
     return "\n".join(front)

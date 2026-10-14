@@ -47,6 +47,8 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_MAX_DURATION_MIN": "298",
     "VOICEMEMOS_MAX_ATTEMPTS": "3",
     "VOICEMEMOS_MARKERS": "idea=Idea,task=Task,remember=Remember,question=Question",
+    "VOICEMEMOS_MARKER_WAKE": "",
+    "VOICEMEMOS_MARKER_END": "",
     "VOICEMEMOS_WORKER": "launchd",
     "VOICEMEMOS_LAUNCHD_LABEL": "local.voicememos-mcp.sync",
     "SONIOX_BASE_URL": "https://api.soniox.com",
@@ -176,6 +178,14 @@ class Config:
     @property
     def markers(self) -> dict[str, str]:
         return _parse_markers(self.get("VOICEMEMOS_MARKERS"))
+
+    @property
+    def marker_spec(self):
+        from .notation import MarkerSpec
+
+        return MarkerSpec(kinds=self.markers,
+                          wake=[w.lower() for w in _split_list(self.get("VOICEMEMOS_MARKER_WAKE"))],
+                          end=[w.lower() for w in _split_list(self.get("VOICEMEMOS_MARKER_END"))])
 
     # ---- selection
     @property

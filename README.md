@@ -120,6 +120,30 @@ The voiceprint is biometric data. It is stored only in `DATA_DIR/voiceprint.json
 600), never in transcripts, and the MCP tools report only a summary. Delete that file to
 remove it.
 
+## Spoken markers
+
+Say a marker word to collect a sentence as an idea, task or question
+(`voicememos_markers`, and a "Markers" list at the top of the transcript).
+
+Without a wake word, any sentence that starts with a marker word counts ("Idea: ...").
+That also catches ordinary sentences, so a wake word is better:
+
+```
+VOICEMEMOS_MARKERS="idea*=Idea,question*=Question,task*=Task,remind*=Reminder"
+VOICEMEMOS_MARKER_WAKE="dictate*"
+VOICEMEMOS_MARKER_END="end"
+VOICEMEMOS_CONTEXT_TERMS="Dictate"   # helps the engine hear the wake word
+```
+
+* "Dictate idea: ..." or "Dictate. Ideas, ..." – punctuation or a pause may separate
+  the words, and `*` accepts inflected forms.
+* A marker covers one sentence. If the marker word ends a sentence on its own, the next
+  sentence is taken. For more, close with "Dictate end"; the next marker also closes one.
+* A wake or marker word heard with low confidence is not dropped: the marker is kept,
+  shown as `Idea (?)` and has `uncertain_trigger` in the JSON.
+* New rules apply to memos transcribed (or rewritten by a second reading or voiceprint
+  run) after the change; older transcripts keep their markers.
+
 ## Second reader
 
 Gemini models return text without word confidence, so they cannot drive the `(?)` marks.
@@ -244,7 +268,9 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_SINCE` | | only auto-transcribe memos from this date on |
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
-| `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence |
+| `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence; `*` accepts inflected forms (`question*=Question`) |
+| `VOICEMEMOS_MARKER_WAKE` | | wake word required before a marker word, e.g. `dictate*`; empty = marker word alone |
+| `VOICEMEMOS_MARKER_END` | | end word after the wake word that closes a longer marker, e.g. `end` |
 | `VOICEMEMOS_DIARIZATION` | `1` | separate speakers in conversations |
 | `VOICEMEMOS_VOICEPRINT_NAME` | | your name, shown when the voiceprint recognises you |
 | `VOICEMEMOS_SECOND_READER` | | `gemini` = second reading for every new memo, `gemini-low` = only for memos with low certainty |

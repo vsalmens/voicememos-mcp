@@ -31,6 +31,7 @@ Basis values:
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 
 PUNCTUATION = ".,!?;:…-–—\"'()"
 TRAILING_PUNCTUATION = ".,!?;:…"
@@ -335,23 +336,112 @@ def stats_line(s: dict) -> str:
 
 
 # ----------------------------------------------------------------------------- spoken markers
+#
+# Two modes. Without a wake word, a sentence that starts with a marker word is a
+# marker ("Idea: ..."), found in the rendered text. With a wake word, a marker
+# needs the wake word right before the marker word ("Dictate idea: ..."), found in
+# the words, so the trigger's confidence is known. Patterns may end in "*" to
+# accept inflected forms ("question*" also matches "questions"). Punctuation or
+# a pause may separate the wake word, the marker word and the body. A marker
+# covers one sentence, or everything up to the end phrase (wake word + end word)
+# when one follows before the next marker. A trigger heard with low confidence
+# is not dropped: the marker is kept and flagged ``uncertain_trigger``.
 
-def extract_markers(text: str, markers: dict[str, str]) -> list[dict]:
-    """Find sentences that start with a spoken marker word, e.g. "Idea: ...".
+MARKER_MAX_WORDS = 300
+MARKER_MAX_CHARS = 2000
+_SENTENCE_END = re.compile(r"[.!?…][\"'”’)\]]*$")
 
-    ``markers`` maps the spoken word (lower case) to the label shown in notes.
-    """
-    if not markers or not text:
+
+@dataclass
+class MarkerSpec:
+    kinds: dict[str, str] = field(default_factory=dict)  # spoken pattern (lower case) -> label
+    wake: list[str] = field(default_factory=list)  # wake word patterns
+    end: list[str] = field(default_factory=list)  # end word patterns (after a wake word)
+
+
+def _pattern_regex(patterns) -> str:
+    return "|".join(sorted((re.escape(p.rstrip("*")) + (r"\w*" if p.endswith("*") else "")
+                            for p in patterns), key=len, reverse=True))
+
+
+def _match(word: str, patterns) -> str | None:
+    """The pattern a single word matches (case-insensitive, punctuation ignored), else None."""
+    token = _norm_word(word)
+    for p in patterns:
+        stem = p.rstrip("*").casefold()
+        if token == stem or (p.endswith("*") and token.startswith(stem)):
+            return p
+    return None
+
+
+def _shaky(word: dict, threshold: float) -> bool:
+    return _is_uncertain(word, threshold) or _has_alternative(word)
+
+
+def _markers_from_words(words: list[dict], spec: MarkerSpec, threshold: float) -> list[dict]:
+    triggers = []  # (wake index, kind pattern or None for an end phrase, index of the kind/end word)
+    for i, w in enumerate(words[:-1]):
+        if not _match(w.get("text", ""), spec.wake):
+            continue
+        nxt = words[i + 1].get("text", "")
+        kind = _match(nxt, spec.kinds)
+        if kind:
+            triggers.append((i, kind, i + 1))
+        elif spec.end and _match(nxt, spec.end):
+            triggers.append((i, None, i + 1))
+    found = []
+    for n, (wake_i, kind, kind_i) in enumerate(triggers):
+        if kind is None:
+            continue
+        start = kind_i + 1
+        nxt = triggers[n + 1] if n + 1 < len(triggers) else None
+        if nxt and nxt[1] is None:  # an end phrase follows before the next marker
+            stop, ended = nxt[0], True
+        else:
+            stop, ended = len(words), False
+            # one sentence; if the marker word itself ends a sentence, the next one
+            for k in range(start, min(stop, start + MARKER_MAX_WORDS)):
+                if _SENTENCE_END.search(words[k].get("text", "")):
+                    stop = k + 1
+                    break
+        stop = min(stop, start + MARKER_MAX_WORDS, nxt[0] if nxt else len(words))
+        body_words = words[start:stop]
+        body = " ".join(render_blocks(body_words, threshold, pause_ms=10 ** 9)).strip()
+        body = body.lstrip(":,.;-–— ").rstrip()
+        if not ended:
+            body = body.rstrip(".!?… ")
+        if len(body) < 3:
+            continue
+        marker = {"label": spec.kinds[kind], "text": body[:MARKER_MAX_CHARS],
+                  "start_ms": words[wake_i].get("start_ms")}
+        if ended:
+            marker["ended_by_phrase"] = True
+        if _shaky(words[wake_i], threshold) or _shaky(words[kind_i], threshold):
+            marker["uncertain_trigger"] = True
+        found.append(marker)
+    return found
+
+
+def extract_markers(text: str, markers, words: list[dict] | None = None, threshold: float = 0.7) -> list[dict]:
+    """Find spoken markers. ``markers`` is a :class:`MarkerSpec` or a plain
+    ``{spoken word: label}`` dict (no wake word)."""
+    spec = markers if isinstance(markers, MarkerSpec) else MarkerSpec(kinds=dict(markers or {}))
+    if not spec.kinds:
         return []
-    words = "|".join(sorted((re.escape(k) for k in markers), key=len, reverse=True))
+    if spec.wake:
+        return _markers_from_words(words or [], spec, threshold)
+    if not text:
+        return []
+    kinds = _pattern_regex(spec.kinds)
     pattern = re.compile(
-        rf"(?:^|(?<=[.!?…\n]))\s*(?P<kw>{words})\b[\s:,.\-–]*"
+        rf"(?:^|(?<=[.!?…\n]))\s*(?P<kw>{kinds})\b[\s:,.\-–]*"
         rf"(?P<body>(?:\[[^\]]*\]|\{{[^}}]*\}}|\(\?\)|[^.!?…\[{{\n])+[.!?…]?)",
         re.IGNORECASE,
     )
     found = []
     for match in pattern.finditer(text):
         body = match.group("body").strip().rstrip(".!?… ")
-        if len(body) >= 3:
-            found.append({"label": markers[match.group("kw").lower()], "text": body[:400]})
+        kind = _match(match.group("kw"), spec.kinds)
+        if len(body) >= 3 and kind:
+            found.append({"label": spec.kinds[kind], "text": body[:400]})
     return found

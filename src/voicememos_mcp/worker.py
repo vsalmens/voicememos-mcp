@@ -296,7 +296,7 @@ class Worker:
                 return {**item, "status": "failed", "error": summary.get("error")}
             data["speakers"], data["voiceprint"] = speakers, summary
             result = self.store.rewrite_transcript(entry["json"], data, self.cfg.threshold, self.cfg.run_min,
-                                                   self.cfg.pause_ms, self.cfg.markers)
+                                                   self.cfg.pause_ms, self.cfg.marker_spec)
         except Exception as exc:  # noqa: BLE001 - a failing memo must not block the queue
             log.exception("Voiceprint identification failed for %s", memo.id)
             return {**item, "status": "failed", "error": str(exc)[:300]}
@@ -386,7 +386,7 @@ class Worker:
                      + ([second_record] if second_record else [])}
             result = self.store.write_transcript(
                 memo.to_dict(), words, engine, had_confidence, self.cfg.threshold,
-                self.cfg.run_min, self.cfg.pause_ms, self.cfg.markers, source_tokens=tokens, extra=extra,
+                self.cfg.run_min, self.cfg.pause_ms, self.cfg.marker_spec, source_tokens=tokens, extra=extra,
             )
             result["language"] = extra["language"]
             result["speakers"] = len(speakers)
@@ -444,7 +444,7 @@ class Worker:
         data["words"] = words
         data.setdefault("language", align.dominant_language(words))
         result = self.store.rewrite_transcript(entry["json"], data, self.cfg.threshold, self.cfg.run_min,
-                                               self.cfg.pause_ms, self.cfg.markers)
+                                               self.cfg.pause_ms, self.cfg.marker_spec)
         entry.update(stats=result["stats"], markers=result["markers"], language=data["language"],
                      speakers=len(data.get("speakers") or {}))
         entry["second_reader"] = {"model": record.get("model"), "agreement": record["agreement"]["agreement"],
