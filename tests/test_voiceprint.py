@@ -172,3 +172,41 @@ def test_voiceprint_from_another_model_is_not_applied(cfg, tmp_path):
     worker = Worker(cfg, transcriber=FakeTranscriber(), embedder=fake_embed, audio_loader=lambda p: None)
     speakers, summary = worker._identify(tmp_path / "x.m4a", [], {})
     assert speakers == {} and summary["result"] == "error" and "enroll again" in summary["error"]
+
+
+def relative(seconds, seed):
+    """A voice close to the owner's (shares the owner's band, plus one of its own)."""
+    return (0.6 * tone(OWNER, seconds, seed) + 0.6 * tone(260, seconds, seed + 100)).astype(np.float32)
+
+
+def test_known_other_voice_blocks_a_close_relative():
+    memos = {f"m{i}": tone(OWNER + i * 3, 20, seed=i, noise=0.05 + 0.02 * i) for i in range(4)}
+    vp = voiceprint.enroll("Alex", "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced", memos, fake_embed)
+    _, before = voiceprint.identify(relative(10, 30), [], {}, vp, fake_embed)
+    assert before["result"] in ("match", "possible")  # the relative alone would be taken for the owner
+
+    vp["others"] = [{**voiceprint.other_voice("Sam", relative(12, 40), [], None, fake_embed), "memo_id": "x"}]
+    _, after = voiceprint.identify(relative(10, 30), [], {}, vp, fake_embed)
+    assert after["result"] == "no match" and after["closest_other"]["name"] == "Sam"
+    _, owner = voiceprint.identify(tone(OWNER, 10, seed=50), [], {}, vp, fake_embed)
+    assert owner["result"] == "match"
+
+    audio = np.concatenate([relative(8, 60), tone(OWNER, 8, seed=61)])
+    words = words_for([("1", 0, 8), ("2", 8, 16)])
+    updated, summary = voiceprint.identify(audio, words, notation.speaker_labels(words), vp, fake_embed)
+    assert summary["speaker"] == "2" and updated["2"]["label"] == "Alex" and updated["1"]["label"] == "S1"
+    assert "Sam" not in json.dumps(updated)  # other voices are never used as labels
+
+
+def test_add_other_voice_validation(cfg, library):
+    Worker(cfg, transcriber=FakeTranscriber()).run()
+    tools = Tools(cfg)
+    with pytest.raises(ToolError):
+        tools.voiceprint("add_other", memos=["aaaa1111"], name="Sam")  # no own voiceprint yet
+    voiceprint.Voiceprint(tools.store.voiceprint_path).save({"name": "Alex", "model": "m", "centroid": [1.0]})
+    with pytest.raises(ToolError):
+        tools.voiceprint("add_other", memos=["aaaa1111", "bbbb2222"], name="Sam")
+    with pytest.raises(ToolError):
+        tools.voiceprint("add_other", memos=["aaaa1111"], name="Sam", speaker="X")
+    job = tools.voiceprint("add_other", memos=["aaaa1111"], name="Sam", speaker="s2")
+    assert tools.store.read_job(job["job_id"])["request"]["speaker"] == "2"

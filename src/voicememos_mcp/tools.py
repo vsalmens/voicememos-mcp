@@ -296,7 +296,7 @@ class Tools:
                 "samples": {lang: group["samples"][:5] for lang, group in report["languages"].items()}}
 
     def voiceprint(self, action: str = "status", memos: list[str] | None = None, since: str | None = None,
-                   until: str | None = None, name: str | None = None) -> dict:
+                   until: str | None = None, name: str | None = None, speaker: str | None = None) -> dict:
         from .voiceprint import Voiceprint, suggest_enrollment
 
         if action == "status":
@@ -325,8 +325,24 @@ class Tools:
                 raise ToolError("no voiceprint enrolled yet (action='enroll')")
             request = {"action": "identify", "memos": [self._find(m)["id"] for m in memos],
                        "since": since, "until": until}
+        elif action in ("add_other", "remove_other"):
+            who = (name or "").strip()
+            if not who or len(who) > 60:
+                raise ToolError("give the other person's name (only used in status and logs)")
+            if not self.store.voiceprint_path.exists():
+                raise ToolError("enroll your own voiceprint first (action='enroll')")
+            if action == "remove_other":
+                request = {"action": "remove_other", "memos": [], "name": who}
+            else:
+                if len(memos) != 1:
+                    raise ToolError("give exactly one memo id")
+                spk = (speaker or "").strip().upper().removeprefix("S") or None
+                if spk is not None and not spk.isdigit():
+                    raise ToolError("speaker must look like S1, S2, ...")
+                request = {"action": "add_other", "memos": [self._find(memos[0])["id"]], "name": who,
+                           "speaker": spk}
         else:
-            raise ToolError("action must be 'status', 'enroll' or 'identify'")
+            raise ToolError("action must be 'status', 'enroll', 'identify', 'add_other' or 'remove_other'")
         self.store.ensure_dirs()
         job_id = self.store.enqueue(request)
         return {"job_id": job_id, "status": "queued", "worker": self._kick_worker(),

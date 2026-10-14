@@ -155,19 +155,25 @@ def build_server(tools: Tools | None = None):
     @server.tool()
     def voicememos_voiceprint(action: str = "status", memos: Optional[list[str]] = None,
                               since: Optional[str] = None, until: Optional[str] = None,
-                              name: Optional[str] = None) -> dict:
+                              name: Optional[str] = None, speaker: Optional[str] = None) -> dict:
         """Recognise the owner's voice with a local voiceprint.
 
         Args:
             action: 'status' (enrollment state, thresholds and suggested enrollment memos),
-                'enroll' (build the voiceprint from memos where only the owner speaks) or
-                'identify' (apply it to already transcribed memos).
-            memos: memo ids for 'enroll' (2+, ideally 4-6 from different years) or 'identify'.
+                'enroll' (build the voiceprint from memos where only the owner speaks),
+                'identify' (apply it to already transcribed memos),
+                'add_other' (store a known other voice, e.g. a relative who sounds similar, from
+                one speaker of one memo; it is never shown by name, it only prevents mistaking
+                that person for the owner) or 'remove_other' (by name).
+            memos: memo ids for 'enroll' (2+, ideally 4-6 from different years), 'identify', or
+                one memo for 'add_other'.
             since: for 'identify': memos recorded on or after this date (YYYY-MM-DD).
             until: for 'identify': memos recorded on or before this date (YYYY-MM-DD).
-            name: name to show for the owner (default from config).
+            name: the owner's name for 'enroll' (default from config); the other person's name
+                for 'add_other' / 'remove_other'.
+            speaker: for 'add_other' in a multi-speaker memo: the speaker label (S1, S2, ...).
         """
-        return call(tools.voiceprint, action, memos, since, until, name)
+        return call(tools.voiceprint, action, memos, since, until, name, speaker)
 
     @server.tool()
     def voicememos_transcribe_status(job_id: Optional[str] = None) -> dict:

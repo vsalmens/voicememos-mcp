@@ -107,6 +107,13 @@ the JSON (`speakers[...].voiceprint`, `voiceprint`).
 Cost: about 30 seconds of speech per speaker is embedded, so identification takes roughly a
 second per memo regardless of its length.
 
+**Known other voices.** A relative can sound close enough to pass the threshold on their own.
+Add such a voice from one speaker of a memo, e.g.
+`voicememos_voiceprint(action="add_other", memos=["<id>"], speaker="S1", name="<name>")`.
+Known other voices are never shown as labels; they only stop a speaker from being labelled as
+you when that speaker is as close, or nearly as close, to a known other voice. Run
+`action="identify"` again afterwards; `action="remove_other", name="<name>"` removes one.
+
 The voiceprint is biometric data. It is stored only in `DATA_DIR/voiceprint.json` (file mode
 600), never in transcripts, and the MCP tools report only a summary. Delete that file to
 remove it.

@@ -216,8 +216,55 @@ class Worker:
                     words[memo.id] = data.get("words", [])
             # The readers decode lazily from the temporary files, so embed before they are removed.
             result = enroll(name, self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL"), samples, self.embedder(), words)
+        previous = Voiceprint(self.store.voiceprint_path).load() or {}
+        if previous.get("model") == result["model"] and previous.get("others"):
+            result["others"] = previous["others"]  # known other voices stay valid with the same model
         Voiceprint(self.store.voiceprint_path).save(result)
         return Voiceprint(self.store.voiceprint_path).summary()
+
+    def add_other_voice(self, memo: Memo, speaker: str | None, name: str) -> dict:
+        """Store a known other person's voice ("not me") from one speaker of a transcribed memo."""
+        from .voiceprint import Voiceprint, other_voice
+
+        store = Voiceprint(self.store.voiceprint_path)
+        data = store.load()
+        if not data:
+            raise RuntimeError("enroll your own voiceprint first")
+        if data.get("model") != self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL"):
+            raise RuntimeError("the voiceprint was made with another model; enroll again first")
+        entry = self.state.get(memo.id, {})
+        transcript = self.store.load_transcript(entry["json"]) if entry.get("ok") else None
+        if not transcript:
+            raise RuntimeError(f"memo {memo.short_id} is not transcribed yet")
+        labels = transcript.get("speakers") or {}
+        if labels and not speaker:
+            raise RuntimeError(f"memo {memo.short_id} has {len(labels)} speakers; say which one (S1, S2, ...)")
+        if speaker and speaker not in labels:
+            raise RuntimeError(f"memo {memo.short_id} has no speaker S{speaker}")
+        if not memo.local or not memo.filename:
+            raise RuntimeError(f"memo {memo.short_id} is not downloaded")
+        with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+            samples = self.load_audio(prepare_audio(self.cfg.recordings_dir / memo.filename, Path(tmp)))
+            voice = other_voice(name, samples, transcript.get("words", []), speaker, self.embedder())
+        voice.update(memo_id=memo.id, speaker=speaker)
+        others = [o for o in data.get("others", []) if (o.get("memo_id"), o.get("speaker")) != (memo.id, speaker)]
+        data["others"] = others + [voice]
+        store.save(data)
+        return store.summary()
+
+    def remove_other_voice(self, name: str) -> dict:
+        from .voiceprint import Voiceprint
+
+        store = Voiceprint(self.store.voiceprint_path)
+        data = store.load()
+        if not data:
+            raise RuntimeError("no voiceprint enrolled")
+        kept = [o for o in data.get("others", []) if o.get("name") != name]
+        if len(kept) == len(data.get("others", [])):
+            raise RuntimeError(f"no known other voice named '{name}'")
+        data["others"] = kept
+        store.save(data)
+        return store.summary()
 
     def identify_memo(self, memo: Memo) -> dict:
         """Apply the voiceprint to an existing transcript (no new transcription)."""
@@ -442,11 +489,18 @@ class Worker:
         try:
             if len(targets) != len(request.get("memos") or []):
                 raise RuntimeError("some memos were not found (excluded, deleted or unknown)")
-            job["voiceprint"] = self.enroll_voiceprint(targets, request.get("name")
-                                                       or self.cfg.get("VOICEMEMOS_VOICEPRINT_NAME"))
+            action = request.get("action")
+            if action == "add_other":
+                for memo in targets:
+                    job["voiceprint"] = self.add_other_voice(memo, request.get("speaker"), request["name"])
+            elif action == "remove_other":
+                job["voiceprint"] = self.remove_other_voice(request["name"])
+            else:
+                job["voiceprint"] = self.enroll_voiceprint(targets, request.get("name")
+                                                           or self.cfg.get("VOICEMEMOS_VOICEPRINT_NAME"))
             job["status"] = "done"
         except Exception as exc:  # noqa: BLE001
-            log.exception("Voiceprint enrollment failed")
+            log.exception("Voiceprint job failed")
             job.update(status="failed", error=str(exc)[:300])
         job["finished"] = now_iso()
         self.store.write_job(job)
@@ -458,7 +512,7 @@ class Worker:
             job = self.store.read_job(request_doc["job_id"]) or request_doc
             request = job.get("request", {})
             action = request.get("action")
-            if action == "enroll":
+            if action in ("enroll", "add_other", "remove_other"):
                 self._run_enroll_job(job, request, memos)
                 jobs.append(job)
                 continue

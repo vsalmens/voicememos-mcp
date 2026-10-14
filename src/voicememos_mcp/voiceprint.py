@@ -18,6 +18,11 @@ Labels:
 * ``Name (?)``  score >= maybe threshold, or not clearly above another speaker
 * otherwise the anonymous label (S1, S2, ...) is kept
 
+Known other voices ("not me", e.g. a relative whose voice is close to the owner's) can be
+added from one speaker of a memo. They are never shown by name; they only stop a speaker
+from being labelled as the owner when that speaker is as close, or nearly as close, to a
+known other voice.
+
 The voiceprint is biometric data. It is stored only in DATA_DIR/voiceprint.json (mode 600)
 and never in transcripts; MCP tools only report a summary.
 
@@ -275,6 +280,33 @@ def mean_embedding(embed: Embedder, windows: list):
     return _unit(np.mean([_unit(embed(w)) for w in windows], axis=0))
 
 
+def other_voice(name: str, samples, words: list[dict] | None, speaker: str | None, embed: Embedder) -> dict:
+    """Embedding of a known other person ("not me"), from one speaker of one memo."""
+    spans = speech_spans(words, speaker) if words else []
+    windows = windows_from_spans(samples, spans, MAX_WINDOWS_ENROLL) if spans else []
+    if len(windows) < 3 and not speaker:
+        windows = energy_windows(samples, MAX_WINDOWS_ENROLL)
+    if len(windows) < 3:
+        raise VoiceprintError("too little speech from that speaker")
+    vector = mean_embedding(embed, windows)
+    return {"name": name, "vector": [round(float(x), 6) for x in vector], "windows": len(windows)}
+
+
+def _other_centroids(voiceprint: dict) -> dict:
+    np = _np()
+    groups: dict[str, list] = {}
+    for other in voiceprint.get("others", []):
+        groups.setdefault(other["name"], []).append(np.array(other["vector"], dtype=np.float32))
+    return {name: _unit(np.mean(vectors, axis=0)) for name, vectors in groups.items()}
+
+
+def _closest_other(vector, others: dict) -> tuple[str | None, float | None]:
+    if not others:
+        return None, None
+    name = max(others, key=lambda n: float(vector @ others[n]))
+    return name, round(float(vector @ others[name]), 4)
+
+
 # ----------------------------------------------------------------------------- voiceprint file
 
 class Voiceprint:
@@ -305,7 +337,8 @@ class Voiceprint:
         return {"enrolled": True, "name": data.get("name"), "model": data.get("model"),
                 "created": data.get("created"), "memos": [e["memo_id"] for e in data.get("enrolled", [])],
                 "own_scores": data.get("own_scores"), "thresholds": data.get("thresholds"),
-                "warnings": data.get("warnings", [])}
+                "warnings": data.get("warnings", []),
+                "other_voices": sorted({o["name"] for o in data.get("others", [])})}
 
 
 # ----------------------------------------------------------------------------- enroll / identify
@@ -373,6 +406,7 @@ def identify(samples, words: list[dict], speakers: dict, voiceprint: dict, embed
     centroid = _unit(np.array(voiceprint["centroid"], dtype=np.float32))
     thresholds = voiceprint["thresholds"]
     name = voiceprint["name"]
+    others = _other_centroids(voiceprint)
 
     if not speakers:  # one speaker (or no diarization): score the whole memo
         windows = windows_from_spans(samples, speech_spans(words), MAX_WINDOWS_PER_SPEAKER)
@@ -384,14 +418,25 @@ def identify(samples, words: list[dict], speakers: dict, voiceprint: dict, embed
         score = round(float(vector @ centroid), 4)
         result = ("match" if score >= thresholds["match"] else "possible" if score >= thresholds["maybe"]
                   else "no match")
-        return speakers, {"name": name, "score": score, "result": result, "thresholds": thresholds}
+        summary = {"name": name, "score": score, "result": result, "thresholds": thresholds}
+        other, other_score = _closest_other(vector, others)
+        if other is not None:
+            summary["closest_other"] = {"name": other, "score": other_score}
+            if other_score >= score:
+                summary["result"] = "no match"
+            elif result == "match" and score - other_score < thresholds.get("margin", MARGIN):
+                summary["result"] = "possible"
+        return speakers, summary
 
-    scores = {}
+    scores, closest = {}, {}
     for spk in speakers:
         vector = mean_embedding(embed, windows_from_spans(samples, speech_spans(words, spk),
                                                           MAX_WINDOWS_PER_SPEAKER))
         if vector is not None:
             scores[spk] = round(float(vector @ centroid), 4)
+            other, other_score = _closest_other(vector, others)
+            if other is not None:
+                closest[spk] = {"name": other, "score": other_score}
     updated = {k: dict(v) for k, v in speakers.items()}
     for spk, score in scores.items():
         updated[spk]["voiceprint"] = score
@@ -399,9 +444,15 @@ def identify(samples, words: list[dict], speakers: dict, voiceprint: dict, embed
     if not scores:
         summary["result"] = "too little speech"
         return updated, summary
+    if closest:
+        summary["closest_other"] = closest
     best = max(scores, key=scores.get)
-    others = [s for k, s in scores.items() if k != best]
-    margin = scores[best] - max(others) if others else 1.0
+    rest = [s for k, s in scores.items() if k != best]
+    margin = scores[best] - max(rest) if rest else 1.0
+    if best in closest:  # a known other voice must also be clearly further away than the owner's
+        if closest[best]["score"] >= scores[best]:
+            return updated, summary
+        margin = min(margin, scores[best] - closest[best]["score"])
     if scores[best] >= thresholds["match"] and margin >= thresholds.get("margin", MARGIN):
         updated[best].update(label=name, basis="voiceprint")
         summary.update(result="match", speaker=best)
