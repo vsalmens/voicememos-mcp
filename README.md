@@ -113,7 +113,7 @@ worker, stores the Soniox key in the Keychain, installs the launchd job and adds
 
 The Voice Memos container is protected by macOS privacy controls. Only the worker needs
 access, and it gets it through a tiny compiled launcher
-([`launcher/voicememos-worker.c`](launcher/voicememos-worker.c)) that `install.sh` builds
+([`launcher/launcher.c`](launcher/launcher.c), built by `launcher/build-launcher.sh`) that `install.sh` builds
 into `~/Library/Application Support/voicememos-mcp/bin/voicememos-worker`. Grant Full Disk
 Access to that file once (`install.sh` prints the path and opens the settings pane), then run
 `launchctl kickstart -k gui/$(id -u)/local.voicememos-mcp.sync`.
