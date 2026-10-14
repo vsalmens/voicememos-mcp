@@ -60,3 +60,18 @@ def prepare_audio(path: Path, workdir: Path) -> Path:
 
     detail = "; ".join(errors) or "neither ffmpeg nor afconvert is available"
     raise RuntimeError(f"Could not convert {path.name} to m4a ({detail})")
+
+
+def cut_audio(path: Path, start_s: float, end_s: float | None, out: Path) -> Path:
+    """Copy the part ``start_s``..``end_s`` (None = to the end) of an audio file without re-encoding."""
+    ffmpeg = find_tool("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is needed to split long recordings for the second reader")
+    cmd = [ffmpeg, "-nostdin", "-loglevel", "error", "-y", "-ss", f"{start_s:.3f}", "-i", str(path)]
+    if end_s is not None:
+        cmd += ["-t", f"{max(end_s - start_s, 0.1):.3f}"]
+    cmd += ["-vn", "-map", "0:a:0", "-c:a", "copy", str(out)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+        raise RuntimeError(f"ffmpeg could not cut the recording: {result.stderr.strip()[:200]}")
+    return out

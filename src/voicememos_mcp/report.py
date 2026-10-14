@@ -79,9 +79,13 @@ def build_report(store: Store, since: str | None = None, until: str | None = Non
         second = next((r for r in data.get("readers", []) if r.get("role") == "second" and not r.get("error")), None)
         if not second:
             continue
-        if second.get("text"):  # re-align with the current comparison rules (e.g. spoken-form folding)
-            words, metrics = align.align(data.get("words", []), second["text"],
-                                         (data.get("stats") or {}).get("threshold") or 0.7)
+        threshold = (data.get("stats") or {}).get("threshold") or 0.7
+        if second.get("chunks"):  # long recording read in parts
+            words, metrics = align.align_chunks(data.get("words", []), second["chunks"], threshold)
+            data = {**data, "words": words}
+            second = {**second, "agreement": metrics}
+        elif second.get("text"):  # re-align with the current comparison rules (e.g. spoken-form folding)
+            words, metrics = align.align(data.get("words", []), second["text"], threshold)
             data = {**data, "words": words}
             second = {**second, "agreement": metrics}
         groups[data.get("language") or "unknown"].append({"memo": memo, "data": data, "second": second})

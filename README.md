@@ -177,6 +177,14 @@ With `VOICEMEMOS_SECOND_READER=gemini-low` only memos whose primary transcript h
 certainty (15 % or more of the words marked) get a second reading automatically: the
 noisy car memos, not the clear ones. `gemini` reads every new memo.
 
+Recordings longer than `VOICEMEMOS_SECOND_READER_MAX_MIN` (60) are read in parts of about
+`VOICEMEMOS_SECOND_READER_CHUNK_MIN` (30) minutes. Cuts fall in a pause between words,
+preferably after a sentence, never inside a word. With `gemini-low` only the parts whose
+own certainty is low are read. Each part is aligned with the same span of the primary
+words; the transcript (JSON and Markdown) stays one piece. One request per part keeps each
+answer well below the model's default output limit (65,536 tokens for Gemini 4 Argon) and
+avoids drift in very long generations.
+
 Transcripts start with a short reading guide that asks language models not to present
 marked words as certain, and to propose corrections visibly (`word→suggestion (?)`).
 
@@ -275,6 +283,8 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_VOICEPRINT_NAME` | | your name, shown when the voiceprint recognises you |
 | `VOICEMEMOS_SECOND_READER` | | `gemini` = second reading for every new memo, `gemini-low` = only for memos with low certainty |
 | `VOICEMEMOS_SECOND_READER_MODEL` | `gemini-4-argon` | |
+| `VOICEMEMOS_SECOND_READER_MAX_MIN` | `60` | longer recordings are read in parts |
+| `VOICEMEMOS_SECOND_READER_CHUNK_MIN` | `30` | approximate length of a part |
 | `VOICEMEMOS_ROAM_ENABLED` | `0` | append new transcripts to Roam daily notes |
 
 Excluded memos are never transcribed, and the MCP tools cannot see them, not even their

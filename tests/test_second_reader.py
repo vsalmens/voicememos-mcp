@@ -231,3 +231,57 @@ def test_gemini_low_reads_only_uncertain_memos(cfg, fake):
     assert not worker.wants_second_read(sure) and worker.wants_second_read(unsure)
     cfg.raw["VOICEMEMOS_SECOND_READER"] = "gemini"
     assert worker.wants_second_read(sure)
+
+
+def long_words(minutes=70, every_s=10):
+    """One 3-word sentence every ``every_s`` seconds, each word 0.5 s, sentence ends with a period."""
+    out = []
+    for n in range(minutes * 60 // every_s):
+        base = n * every_s * 1000
+        for k, t in enumerate(["alpha", "beta", f"gamma{n}."]):
+            out.append({"text": t, "conf": 0.99, "start_ms": base + k * 600, "end_ms": base + k * 600 + 500,
+                        "lang": "en"})
+    return out
+
+
+def test_plan_chunks_cuts_between_sentences_into_equal_parts():
+    words = long_words(70)
+    chunks = align.plan_chunks(words, 30 * 60_000)
+    assert len(chunks) == 2 and chunks[0]["first"] == 0 and chunks[-1]["last"] == len(words)
+    cut = chunks[1]["first"]
+    assert words[cut - 1]["text"].endswith(".") and words[cut]["text"] == "alpha"
+    assert words[cut - 1]["end_ms"] < chunks[0]["end_ms"] < words[cut]["start_ms"]
+    assert abs(chunks[0]["end_ms"] - 35 * 60_000) < 5 * 60_000 and chunks[1]["end_ms"] is None
+    assert len(align.plan_chunks(words[:30], 30 * 60_000)) == 1
+
+
+def test_long_memo_read_in_parts_only_uncertain(cfg, tmp_path):
+    from types import SimpleNamespace
+
+    words = long_words(70)
+    first_cut = align.plan_chunks(words, 30 * 60_000)[1]["first"]
+    for w in words[first_cut:]:
+        w["conf"] = 0.3  # the second half is uncertain
+    cuts, reads = [], []
+
+    def cutter(audio, start_s, end_s, out):
+        cuts.append((start_s, end_s))
+        out.write_text("clip")
+        return out
+
+    def reader(clip):
+        reads.append(clip.name)
+        return {"text": " ".join(w["text"] for w in words[first_cut:]).replace("beta", "bravo", 1),
+                "model": "gemini-4-argon", "usage": {"totalTokenCount": 7}}
+
+    worker = Worker(cfg, transcriber=None, second_reader=reader, audio_cutter=cutter)
+    audio = tmp_path / "long.m4a"
+    audio.write_text("x")
+    memo = SimpleNamespace(id="long", duration_s=70 * 60)
+    out, record = worker._apply_second_reader(reader, audio, memo, words, only_uncertain=True)
+    assert len(reads) == 1 and cuts[0][1] is None and cuts[0][0] > 30 * 60
+    assert [c["text"] is None for c in record["chunks"]] == [True, False]
+    assert record["agreement"]["chunks_read"] == 1 and record["agreement"]["substituted"] == 1
+    assert len(out) == len(words) and out[first_cut + 1]["alts"] == ["bravo"]
+    out_all, record_all = worker._apply_second_reader(reader, audio, memo, words, only_uncertain=False)
+    assert len(reads) == 3 and record_all["agreement"]["chunks_read"] == 2

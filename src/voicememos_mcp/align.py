@@ -152,3 +152,77 @@ def align(primary: list[dict], reader_text: str, threshold: float = 0.7) -> tupl
         "spoken_forms_folded": folded,
     }
     return words, metrics
+
+
+# ----------------------------------------------------------------------------- long recordings
+#
+# A long recording is read by the second reader in parts of about equal length
+# (default about 30 min). Cuts fall in a pause between two words, preferably after
+# a sentence, never inside a word. Each part is aligned with the primary words of
+# the same span; the transcript itself stays one piece.
+
+SENTENCE_END = re.compile(r"[.!?…][\"'”’)\]]*$")
+COUNT_KEYS = ("primary_words", "reader_words", "matched", "substituted", "deleted", "inserted",
+              "disagreement_spans", "spans_with_low_primary_confidence", "low_confidence_words",
+              "low_confidence_words_confirmed_by_reader", "reader_unsure_marks", "reader_gaps",
+              "spoken_forms_folded")
+
+
+def plan_chunks(words: list[dict], chunk_ms: int, window_ms: int = 5 * 60_000) -> list[dict]:
+    """Split the word list into parts of about ``chunk_ms``.
+
+    Returns ``[{"first", "last", "start_ms", "end_ms"}]``: word index range (``last``
+    exclusive) and audio span (``end_ms`` None for the last part).
+    """
+    timed = [i for i, w in enumerate(words) if w.get("start_ms") is not None and w.get("end_ms") is not None]
+    if not timed or chunk_ms <= 0:
+        return [{"first": 0, "last": len(words), "start_ms": 0, "end_ms": None}]
+    total = words[timed[-1]]["end_ms"]
+    parts = max(1, round(total / chunk_ms))
+    length = total / parts
+    gaps = []  # (cut_ms, index of first word after the cut, pause length, after a sentence)
+    for a, b in zip(timed, timed[1:]):
+        end, start = words[a]["end_ms"], words[b]["start_ms"]
+        gaps.append(((end + max(start, end)) // 2, b, max(start - end, 0),
+                     bool(SENTENCE_END.search(words[a].get("text", "")))))
+    cuts = []
+    for k in range(1, parts):
+        target = k * length
+        near = [g for g in gaps if abs(g[0] - target) <= window_ms and (not cuts or g[1] > cuts[-1][1])]
+        if not near:
+            near = [g for g in gaps if not cuts or g[1] > cuts[-1][1]]
+        if not near:
+            break
+        best = max(near, key=lambda g: (g[3], g[2] >= 400, -abs(g[0] - target) // 60_000, g[2]))
+        cuts.append(best)
+    out, first, start_ms = [], 0, 0
+    for cut_ms, index, _, _ in cuts:
+        out.append({"first": first, "last": index, "start_ms": start_ms, "end_ms": cut_ms})
+        first, start_ms = index, cut_ms
+    out.append({"first": first, "last": len(words), "start_ms": start_ms, "end_ms": None})
+    return out
+
+
+def align_chunks(primary: list[dict], chunks: list[dict], threshold: float = 0.7) -> tuple[list[dict], dict]:
+    """Align each part that has reader text with its own span of the primary words."""
+    words: list[dict] = []
+    totals = dict.fromkeys(COUNT_KEYS, 0)
+    read = 0
+    for chunk in chunks:
+        part = primary[chunk["first"]:chunk["last"]]
+        if chunk.get("text") is None:
+            words += part
+            continue
+        aligned, metrics = align(part, chunk["text"], threshold)
+        words += aligned
+        read += 1
+        for key in COUNT_KEYS:
+            totals[key] += metrics.get(key, 0)
+    n_a, n_b = totals["primary_words"], totals["reader_words"]
+    totals.update(
+        agreement=round(totals["matched"] / max(n_a, n_b), 3) if max(n_a, n_b) else 1.0,
+        word_difference_rate=round((totals["substituted"] + totals["deleted"] + totals["inserted"]) / n_a, 3)
+        if n_a else None,
+        chunks_read=read, chunks_total=len(chunks),
+    )
+    return words, totals

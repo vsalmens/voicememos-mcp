@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import align, notation, roam
-from .audio import prepare_audio
+from .audio import cut_audio, prepare_audio
 from .config import Config
 from .library import LibraryError, Memo, is_excluded, read_library
 from .store import Store, now_iso
@@ -108,7 +108,8 @@ def _in_range(memo: Memo, since: str | None, until: str | None) -> bool:
 class Worker:
     def __init__(self, cfg: Config, store: Store | None = None, transcriber: Transcriber | None = None,
                  roam_session=None, clock: Callable[[], float] = time.time,
-                 second_reader: SecondReader | None = None, embedder=None, audio_loader=None):
+                 second_reader: SecondReader | None = None, embedder=None, audio_loader=None,
+                 audio_cutter: Callable = cut_audio):
         self.cfg = cfg
         self.store = store or Store(cfg.data_dir, cfg.output_dir)
         self.store.stamp_every_s = cfg.timestamp_every_s
@@ -116,6 +117,7 @@ class Worker:
         self._second_reader = second_reader
         self._embedder = embedder
         self._audio_loader = audio_loader
+        self._cut_audio = audio_cutter
         self.roam_session = roam_session
         self.clock = clock
         self.state: dict = {}
@@ -146,18 +148,48 @@ class Worker:
             return True
         return notation.stats(words, self.cfg.threshold)["certainty"] == "low"
 
-    def _apply_second_reader(self, reader: SecondReader, audio: Path, memo: Memo, words: list[dict]) -> tuple[list[dict], dict]:
-        """Run the second reader and align it. Returns (words, reader_record). Never raises."""
+    def is_long(self, memo: Memo, words: list[dict]) -> bool:
+        """Longer than ``VOICEMEMOS_SECOND_READER_MAX_MIN``: read in parts."""
+        limit_ms = float(self.cfg.get("VOICEMEMOS_SECOND_READER_MAX_MIN")) * 60_000
+        duration_ms = (memo.duration_s or 0) * 1000 or (words[-1].get("end_ms") or 0 if words else 0)
+        return duration_ms > limit_ms
+
+    def _apply_second_reader(self, reader: SecondReader, audio: Path, memo: Memo, words: list[dict],
+                             only_uncertain: bool = False) -> tuple[list[dict], dict]:
+        """Run the second reader and align it. Returns (words, reader_record). Never raises.
+
+        Long recordings are read in parts of about ``VOICEMEMOS_SECOND_READER_CHUNK_MIN``;
+        with ``only_uncertain`` only parts whose primary transcript has low certainty."""
         record: dict = {"role": "second", "provider": "gemini", "created": now_iso()}
-        max_s = float(self.cfg.get("VOICEMEMOS_SECOND_READER_MAX_MIN")) * 60
-        if memo.duration_s and memo.duration_s > max_s:
-            record["error"] = f"skipped: longer than {max_s / 60:.0f} min"
-            return words, record
         try:
-            result = reader(audio)
-            aligned, metrics = align.align(words, result["text"], self.cfg.threshold)
-            record.update(model=result.get("model"), text=result["text"], usage=result.get("usage", {}),
-                          finish_reason=result.get("finish_reason"), agreement=metrics)
+            if not self.is_long(memo, words):
+                result = reader(audio)
+                aligned, metrics = align.align(words, result["text"], self.cfg.threshold)
+                record.update(model=result.get("model"), text=result["text"], usage=result.get("usage", {}),
+                              finish_reason=result.get("finish_reason"), agreement=metrics)
+                return aligned, record
+            chunk_ms = int(float(self.cfg.get("VOICEMEMOS_SECOND_READER_CHUNK_MIN")) * 60_000)
+            chunks = align.plan_chunks(words, chunk_ms)
+            tokens, model = 0, None
+            with tempfile.TemporaryDirectory(prefix="voicememos-part-") as tmp:
+                for k, chunk in enumerate(chunks):
+                    certainty = notation.stats(words[chunk["first"]:chunk["last"]], self.cfg.threshold)["certainty"]
+                    chunk["certainty"] = certainty
+                    if only_uncertain and certainty != "low":
+                        chunk["text"] = None
+                        continue
+                    end_s = chunk["end_ms"] / 1000 if chunk["end_ms"] is not None else None
+                    clip = self._cut_audio(audio, chunk["start_ms"] / 1000, end_s,
+                                           Path(tmp) / f"part{k + 1}{audio.suffix or '.m4a'}")
+                    result = reader(clip)
+                    chunk.update(text=result["text"], finish_reason=result.get("finish_reason"))
+                    tokens += (result.get("usage") or {}).get("totalTokenCount", 0)
+                    model = model or result.get("model")
+            if not any(c.get("text") is not None for c in chunks):
+                record["error"] = "skipped: no part with low certainty"
+                return words, record
+            aligned, metrics = align.align_chunks(words, chunks, self.cfg.threshold)
+            record.update(model=model, chunks=chunks, usage={"totalTokenCount": tokens}, agreement=metrics)
             return aligned, record
         except Exception as exc:  # noqa: BLE001 - the primary transcript must survive
             log.exception("Second reader failed for %s", memo.id)
@@ -368,8 +400,10 @@ class Worker:
                 tokens = self.transcriber(audio)
                 words, had_confidence = notation.tokens_to_words(tokens)
                 reader = None if dry_run else self.second_reader()
-                if reader is not None and self.wants_second_read(words):
-                    words, second_record = self._apply_second_reader(reader, audio, memo, words)
+                long = self.is_long(memo, words)
+                if reader is not None and (long or self.wants_second_read(words)):
+                    only_uncertain = self.cfg.get("VOICEMEMOS_SECOND_READER") == "gemini-low"
+                    words, second_record = self._apply_second_reader(reader, audio, memo, words, only_uncertain)
                 speakers = notation.speaker_labels(words)
                 voice = None
                 if not dry_run:
