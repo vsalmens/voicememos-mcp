@@ -75,10 +75,19 @@ every word.
 ## Voiceprint (optional)
 
 To show your name instead of `S1`, the worker can recognise your voice locally. A small
-speaker model ([WeSpeaker](https://github.com/wenet-e2e/wespeaker) ResNet34 trained on
-VoxCeleb, run with [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx); about 26 MB,
-downloaded once and checked against a pinned SHA-256) turns speech into an embedding; your
-voiceprint is the average embedding of a few memos where only you speak.
+speaker model ([3D-Speaker](https://github.com/modelscope/3D-Speaker) CAM++ trained on a large
+Chinese and English corpus, run with [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx);
+about 28 MB, downloaded once and checked against a pinned SHA-256) turns speech into an
+embedding; your voiceprint is the average embedding of a few memos where only you speak.
+
+Why this model: on a small test set of Finnish and English memos (one owner, recorded on three
+phones over eight years, with and without earphones, plus other speakers), VoxCeleb-trained
+models (WeSpeaker ResNet34/ResNet293, CAM++) scored another Finnish speaker almost as high
+as the owner, so the recording conditions weighed more than the voice. CAM++ "common
+advanced" kept a clear gap (owner 0.56 to 0.77 on held-out memos, the other speaker 0.32),
+NVIDIA TitaNet-L came second. This is one person's data, so treat it as a sanity check, not
+a benchmark; `VOICEMEMOS_VOICEPRINT_MODEL` also accepts `wespeaker_en_voxceleb_resnet34_LM`.
+Changing the model requires enrolling again.
 
 1. `voicememos_voiceprint(action="status")` suggests enrollment memos: transcribed with
    diarization, one speaker, 30 s to 15 min, spread over the years. Check that only you

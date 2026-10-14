@@ -161,3 +161,14 @@ def test_suggestions_prefer_diarized_single_speaker_memos_across_years():
          "transcript": {"json": "v"}},
     ]
     assert [m["short_id"] for m in voiceprint.suggest_enrollment(memos)] == ["a", "b"]
+
+
+def test_voiceprint_from_another_model_is_not_applied(cfg, tmp_path):
+    from voicememos_mcp.store import Store
+
+    store = Store(cfg.data_dir, cfg.output_dir)
+    voiceprint.Voiceprint(store.voiceprint_path).save({"name": "Alex", "model": "some-old-model",
+                                                       "centroid": [1.0, 0.0], "thresholds": {}})
+    worker = Worker(cfg, transcriber=FakeTranscriber(), embedder=fake_embed, audio_loader=lambda p: None)
+    speakers, summary = worker._identify(tmp_path / "x.m4a", [], {})
+    assert speakers == {} and summary["result"] == "error" and "enroll again" in summary["error"]

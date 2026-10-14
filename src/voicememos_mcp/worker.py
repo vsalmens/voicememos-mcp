@@ -185,6 +185,11 @@ class Worker:
         voiceprint = Voiceprint(self.store.voiceprint_path).load()
         if not voiceprint:
             return speakers, None
+        model = self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL")
+        if voiceprint.get("model") != model:
+            return speakers, {"name": voiceprint.get("name"), "result": "error",
+                              "error": f"the voiceprint was made with {voiceprint.get('model')}, but the "
+                                       f"configured model is {model}; enroll again"}
         try:
             return identify(self.load_audio(audio), words, speakers, voiceprint, self.embedder())
         except Exception as exc:  # noqa: BLE001 - the transcript must survive

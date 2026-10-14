@@ -2,8 +2,11 @@
 
 A voiceprint is the average speaker embedding of a few memos in which only the owner
 speaks. Speakers in other memos are compared with it by cosine similarity. Embeddings
-come from a small ONNX speaker model (WeSpeaker ResNet34 trained on VoxCeleb) run with
-sherpa-onnx; nothing leaves the machine.
+come from a small ONNX speaker model run with sherpa-onnx; nothing leaves the machine. The
+default is 3D-Speaker CAM++ trained on a large Chinese and English corpus ("common advanced",
+28 MB). On a test set of Finnish and English memos it separated the owner from other speakers
+clearly, while VoxCeleb-only models gave other Finnish speakers nearly the same scores as the
+owner, so recording conditions mattered more to them than the voice.
 
 Calibration: when enrolling, each enrollment memo is scored against a voiceprint built
 from the others (leave-one-out). The lowest of those scores sets the "match" threshold,
@@ -48,18 +51,28 @@ MAX_WINDOWS_PER_SPEAKER = 12   # about 30 s of speech: constant cost per memo
 MAX_WINDOWS_ENROLL = 40
 MARGIN = 0.05                  # owner must beat the next speaker by this much for a firm label
 MAYBE_GAP = 0.08               # maybe threshold = match threshold - this
-THRESHOLD_FLOOR, THRESHOLD_CEIL = 0.65, 0.95
+DEFAULT_BOUNDS = (0.65, 0.95)         # clamp for the match threshold when a model has no own bounds
 
 MAX_MODEL_BYTES = 200 * 1024 * 1024
 
 # The release tag "speaker-recongition-models" is spelled that way upstream; do not "fix" it.
 MODELS = {
+    "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced": {
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
+               "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+        "sha256": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+        # Scores spread wider with this model (owner about 0.5-0.8, others below 0.4), so the
+        # clamp, the "possible" band and the spread warning are scaled to it.
+        "bounds": (0.35, 0.85), "maybe_gap": 0.05, "spread_warning": 0.25,
+    },
     "wespeaker_en_voxceleb_resnet34_LM": {
         "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
                "wespeaker_en_voxceleb_resnet34_LM.onnx",
         "sha256": "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012",
+        "bounds": (0.65, 0.95),
     },
 }
+DEFAULT_MODEL = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced"
 
 
 class VoiceprintError(RuntimeError):
@@ -317,21 +330,25 @@ def enroll(name: str, model: str, samples_by_memo: dict[str, object], embed: Emb
         per_memo[memo_id] = vectors
         enrolled.append({"memo_id": memo_id, "windows": len(windows)})
 
-    centroid = _unit(np.mean(np.vstack(list(per_memo.values())), axis=0))
+    # Every memo weighs the same, so one long memo cannot dominate the voiceprint.
+    memo_means = {k: _unit(v.mean(axis=0)) for k, v in per_memo.items()}
+    centroid = _unit(np.mean(list(memo_means.values()), axis=0))
     own_scores = {}
     for memo_id, vectors in per_memo.items():
-        others = np.vstack([v for k, v in per_memo.items() if k != memo_id])
-        reference = _unit(others.mean(axis=0))
+        reference = _unit(np.mean([m for k, m in memo_means.items() if k != memo_id], axis=0))
         sample = vectors[: MAX_WINDOWS_PER_SPEAKER]  # score like a speaker in a normal memo
         own_scores[memo_id] = round(float(_unit(sample.mean(axis=0)) @ reference), 4)
 
     lowest = min(own_scores.values())
-    match = float(min(max(lowest - 0.02, THRESHOLD_FLOOR), THRESHOLD_CEIL))
+    spec = MODELS.get(model, {})
+    floor, ceil = spec.get("bounds", DEFAULT_BOUNDS)
+    match = float(min(max(lowest - 0.02, floor), ceil))
+    maybe_gap = spec.get("maybe_gap", MAYBE_GAP)
     warnings = []
     if len(samples_by_memo) < 4:
         warnings.append("fewer than 4 enrollment memos: thresholds are rough")
     spread = max(own_scores.values()) - lowest
-    if spread > 0.15:
+    if spread > spec.get("spread_warning", 0.15):
         warnings.append("enrollment memos differ a lot from each other; check that only you speak in them")
     return {
         "name": name,
@@ -341,7 +358,7 @@ def enroll(name: str, model: str, samples_by_memo: dict[str, object], embed: Emb
         "centroid": [round(float(x), 6) for x in centroid],
         "enrolled": enrolled,
         "own_scores": own_scores,
-        "thresholds": {"match": round(match, 4), "maybe": round(match - MAYBE_GAP, 4), "margin": MARGIN},
+        "thresholds": {"match": round(match, 4), "maybe": round(match - maybe_gap, 4), "margin": MARGIN},
         "warnings": warnings,
     }
 
