@@ -30,3 +30,8 @@ def test_launchd_plist_watches_recordings_and_queue(cfg):
     plist = launchd_plist(cfg, ["/x/python", "-m", "voicememos_mcp", "sync"])
     assert "<string>local.voicememos-mcp.sync</string>" in plist
     assert str(cfg.data_dir / "queue") in plist and str(cfg.recordings_dir) in plist
+
+
+def test_launchd_plist_can_use_launcher(cfg):
+    plist = launchd_plist(cfg, ["/opt/x/voicememos-worker"])
+    assert "<array><string>/opt/x/voicememos-worker</string></array>" in plist

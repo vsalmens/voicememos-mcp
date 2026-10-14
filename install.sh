@@ -2,7 +2,9 @@
 # Install or update voicememos-mcp on macOS. Run from the repository:  ./install.sh
 #
 #   1. MCP server      -> uv tool (~/.local/bin/voicememos-mcp), used by Claude Desktop
-#   2. worker          -> its own virtualenv, run by launchd; the only part that reads Voice Memos
+#   2. worker          -> its own virtualenv, run by launchd; the only part that reads Voice Memos.
+#                         A small compiled launcher (launcher/voicememos-worker.c) starts it, so Full
+#                         Disk Access is granted to that launcher once and survives Python upgrades.
 #   3. configuration   -> ~/.config/voicememos-mcp/config.env (created from the example if missing)
 #   4. secrets         -> macOS Keychain, service "voicememos-mcp" (never written to a file):
 #                         SONIOX_API_KEY, plus GEMINI_API_KEY / ROAM_API_TOKEN when those features are on
@@ -60,8 +62,30 @@ WORKER_VENV="$DATA_DIR/worker-venv"
 uv venv --allow-existing --python "$WORKER_PYTHON_VERSION" "$WORKER_VENV" >/dev/null
 uv pip install --python "$WORKER_VENV/bin/python" --reinstall "$SRC_DIR" >/dev/null
 WORKER_PY="$WORKER_VENV/bin/python"
-REAL_PY="$("$WORKER_PY" -c 'import os, sys; print(os.path.realpath(sys.executable))')"
 echo "  $WORKER_PY"
+
+# Fixed-command launcher: rebuilt only when its source or the interpreter path changes, so the
+# binary (and with it the Full Disk Access grant) stays the same across updates.
+LAUNCHER="$DATA_DIR/bin/voicememos-worker"
+STAMP="$LAUNCHER.stamp"
+WANT="$(cat "$SRC_DIR/launcher/voicememos-worker.c"; echo "$WORKER_PY")"
+WANT_HASH="$(printf '%s' "$WANT" | shasum -a 256 | cut -d' ' -f1)"
+FDA_TARGET=""
+if [ -x "$LAUNCHER" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$WANT_HASH" ]; then
+  echo "  launcher unchanged: $LAUNCHER"
+  FDA_TARGET="$LAUNCHER"
+elif command -v cc >/dev/null 2>&1; then
+  mkdir -p "$DATA_DIR/bin"
+  cc -O2 -DWORKER_PYTHON="\"$WORKER_PY\"" -o "$LAUNCHER" "$SRC_DIR/launcher/voicememos-worker.c"
+  echo "$WANT_HASH" > "$STAMP"
+  echo "  launcher built: $LAUNCHER (grant Full Disk Access to this file)"
+  FDA_TARGET="$LAUNCHER"
+else
+  echo "  no C compiler (xcode-select --install); falling back to the interpreter."
+  echo "  Full Disk Access will then have to be granted again after Python upgrades."
+  LAUNCHER=""
+  FDA_TARGET="$("$WORKER_PY" -c 'import os, sys; print(os.path.realpath(sys.executable))')"
+fi
 
 echo "== 4/6 secrets (Keychain service: $SERVICE)"
 store_secret() {
@@ -84,7 +108,11 @@ if [ "$DO_LAUNCHD" = "1" ]; then
   echo "== 5/6 launchd worker ($LABEL)"
   PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
   mkdir -p "$HOME/Library/LaunchAgents"
-  "$WORKER_PY" -m voicememos_mcp launchd-plist --python "$WORKER_PY" > "$PLIST"
+  if [ -n "$LAUNCHER" ]; then
+    "$WORKER_PY" -m voicememos_mcp launchd-plist --launcher "$LAUNCHER" > "$PLIST"
+  else
+    "$WORKER_PY" -m voicememos_mcp launchd-plist --python "$WORKER_PY" > "$PLIST"
+  fi
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   echo "  installed $PLIST"
@@ -120,8 +148,8 @@ if [ "$DO_LAUNCHD" = "1" ]; then
        "$DATA_DIR/worker.json" 2>/dev/null; then
     echo "  ok: the worker can read the library. Log: $DATA_DIR/logs/worker.log"
   else
-    echo "  The worker cannot read Voice Memos yet. Grant Full Disk Access to this interpreter:"
-    echo "    $REAL_PY"
+    echo "  The worker cannot read Voice Memos yet. Grant Full Disk Access to:"
+    echo "    $FDA_TARGET"
     echo "  System Settings > Privacy & Security > Full Disk Access > + > Cmd+Shift+G, paste the path."
     echo "  Then:  launchctl kickstart -k gui/$(id -u)/$LABEL"
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null || true

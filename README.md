@@ -111,18 +111,26 @@ worker, stores the Soniox key in the Keychain, installs the launchd job and adds
 
 ### Full Disk Access
 
-The Voice Memos container is protected by macOS privacy controls. The worker's
-interpreter needs Full Disk Access; `install.sh` prints its path and opens the settings
-pane. Grant it, then run `launchctl kickstart -k gui/$(id -u)/local.voicememos-mcp.sync`.
+The Voice Memos container is protected by macOS privacy controls. Only the worker needs
+access, and it gets it through a tiny compiled launcher
+([`launcher/voicememos-worker.c`](launcher/voicememos-worker.c)) that `install.sh` builds
+into `~/Library/Application Support/voicememos-mcp/bin/voicememos-worker`. Grant Full Disk
+Access to that file once (`install.sh` prints the path and opens the settings pane), then run
+`launchctl kickstart -k gui/$(id -u)/local.voicememos-mcp.sync`.
 
-Notes:
+Why a launcher:
 
-* macOS grants the permission to the interpreter binary, so every script run with that
-  same binary gets it. The worker therefore uses its own virtualenv and, by default, a
-  uv-managed Python (`VOICEMEMOS_WORKER_PYTHON`, default 3.13). For stronger isolation,
-  pick a Python version nothing else on the machine uses.
-* The MCP server does not need Full Disk Access. Do not grant it to Claude Desktop: every
-  local MCP server it starts would inherit it.
+* macOS ties the permission to the exact binary. Granting it to a Python interpreter breaks
+  with every Python update, and it would cover every script run with that interpreter.
+* The launcher starts the worker as a child process, and macOS attributes the child's file
+  access to it, as it does for programs started from Terminal. It runs one compiled-in
+  command and ignores arguments, so it cannot be used to run anything else.
+* `install.sh` rebuilds it only when its source or the worker path changes, so the grant
+  survives updates. Without a C compiler (`xcode-select --install`) the installer falls back
+  to granting the interpreter.
+
+The MCP server does not need Full Disk Access. Do not grant it to Claude Desktop: every
+local MCP server it starts would inherit it.
 
 Check the setup with `voicememos-mcp check` (from Terminal; Terminal may have different
 permissions than the launchd job) and the worker log in

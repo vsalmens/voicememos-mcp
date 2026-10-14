@@ -159,7 +159,10 @@ def launchd_plist(cfg, program: list[str]) -> str:
 
 def cmd_launchd_plist(args) -> int:
     cfg = load_config()
-    program = [args.python or sys.executable, "-m", "voicememos_mcp", "sync"]
+    if args.launcher:
+        program = [args.launcher]
+    else:
+        program = [args.python or sys.executable, "-m", "voicememos_mcp", "sync"]
     print(launchd_plist(cfg, program), end="")
     return 0
 
@@ -201,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("launchd-plist", help="print a launchd job definition for the worker")
     p.add_argument("--python", help="interpreter for the job (default: this one)")
+    p.add_argument("--launcher", help="run this fixed-command launcher instead of the interpreter")
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=os.environ.get("VOICEMEMOS_LOG_LEVEL", "INFO"),
