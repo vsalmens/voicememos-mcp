@@ -138,8 +138,24 @@ fi
 if [ "$DO_LAUNCHD" = "1" ]; then
   echo
   echo "Checking whether the worker can read Voice Memos ..."
-  launchctl kickstart -k "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-  sleep 6
+  BEFORE="$(date +%s)"
+  # No -k: a run that is already transcribing is left alone; its status answers the question too.
+  launchctl kickstart "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+  # Wait for a worker run that started after the kickstart, or one that is still running (usually a
+  # second or two, at most 30 s), instead of a fixed pause that could read the previous run's result.
+  "$WORKER_PY" - "$DATA_DIR/worker.json" "$BEFORE" <<'PY' 2>/dev/null
+import datetime as dt, json, sys, time
+path, before = sys.argv[1], float(sys.argv[2])
+for _ in range(60):
+    try:
+        d = json.load(open(path))
+        started = dt.datetime.fromisoformat(d.get("started", "")).timestamp()
+        if d.get("running") or (started >= before - 1 and (d.get("finished") or d.get("error"))):
+            break
+    except (OSError, ValueError):
+        pass
+    time.sleep(0.5)
+PY
   if "$WORKER_PY" -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get('library_readable') else 1)" \
        "$DATA_DIR/worker.json" 2>/dev/null; then
     echo "  ok: the worker can read the library. Log: $DATA_DIR/logs/worker.log"
