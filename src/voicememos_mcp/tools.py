@@ -59,6 +59,7 @@ class Tools:
     def __init__(self, cfg: Config, store: Store | None = None):
         self.cfg = cfg
         self.store = store or Store(cfg.data_dir, cfg.output_dir)
+        self.store.stamp_every_s = cfg.timestamp_every_s
 
     # ------------------------------------------------------------------ helpers
     def _permission_hint(self) -> str:
@@ -194,9 +195,10 @@ class Tools:
             return {**info, "data": body}
         if format == "text":
             text = "\n\n".join(notation.render_blocks(data.get("words", []), thr, self.cfg.run_min,
-                                                      self.cfg.pause_ms, data.get("speakers")))
+                                                      self.cfg.pause_ms, data.get("speakers"),
+                                                      self.cfg.timestamp_every_s))
         elif format == "markdown":
-            text = render_markdown(data, thr, self.cfg.run_min, self.cfg.pause_ms)
+            text = render_markdown(data, thr, self.cfg.run_min, self.cfg.pause_ms, self.cfg.timestamp_every_s)
         else:
             raise ToolError("format must be 'markdown', 'text' or 'json'")
         offset = max(0, int(offset))

@@ -40,8 +40,38 @@ READER_NOTE = (
     "`{a|b}` means two independent engines heard different things (primary engine first, neither is "
     "known to be right; `∅` = that engine heard nothing); `[?]` marks speech that was not recognised. "
     "Use marked words, but do not present them as certain. If context suggests a different word, propose "
-    "it visibly as `word→suggestion (?)` instead of replacing it silently."
+    "it visibly as `word→suggestion (?)` instead of replacing it silently. `[?: word ×N]` means the "
+    "engine produced the same word N times in a row, usually a mishearing over music or noise. "
+    "`[mm:ss]` / `[h:mm:ss]` at the start of a paragraph is its time in the recording."
 )
+
+REPEAT_MIN = 4  # this many identical words in a row are treated as a recognition loop
+
+
+def _norm_word(text: str) -> str:
+    return re.sub(r"[^\w]+", "", (text or "").lower())
+
+
+def repetition_runs(words: list[dict], min_len: int = REPEAT_MIN) -> dict[int, int]:
+    """Start index -> end index (exclusive) of runs of the same word by the same speaker."""
+    runs, i, n = {}, 0, len(words)
+    while i < n:
+        key = _norm_word(words[i].get("text", ""))
+        j = i + 1
+        while (key and j < n and _norm_word(words[j].get("text", "")) == key
+               and words[j].get("speaker") == words[i].get("speaker")
+               and not words[j].get("span") and not _has_alternative(words[j])):
+            j += 1
+        if key and j - i >= min_len and not words[i].get("span") and not _has_alternative(words[i]):
+            runs[i] = j
+        i = j
+    return runs
+
+
+def _clock(ms: int, long_form: bool) -> str:
+    sec = int(ms // 1000)
+    h, m, s = sec // 3600, sec % 3600 // 60, sec % 60
+    return f"[{h}:{m:02d}:{s:02d}]" if long_form else f"[{m:02d}:{s:02d}]"
 
 
 # ----------------------------------------------------------------------------- tokens -> words
@@ -99,19 +129,23 @@ def _has_alternative(word: dict) -> bool:
 
 def annotate(words: list[dict], threshold: float) -> list[dict]:
     """Add ``flag``/``basis`` to each word for the given threshold (returns new dicts)."""
+    repeated = {k for a, b in repetition_runs(words).items() for k in range(a, b)}
     out = []
-    for word in words:
+    for idx, word in enumerate(words):
         item = dict(word)
         conf = item.get("conf")
         if _has_alternative(item):
             item["flag"] = "alternatives"
             item.setdefault("basis", "reader_disagreement")
+        elif idx in repeated:
+            item["flag"] = "repetition"
+            item["basis"] = "repetition_loop"
         elif conf is not None and conf < threshold:
             item["flag"] = "uncertain"
             item["basis"] = "asr_confidence"
         else:
             item.pop("flag", None)
-            if item.get("basis") == "asr_confidence":
+            if item.get("basis") in ("asr_confidence", "repetition_loop"):
                 item.pop("basis")
         out.append(item)
     return out
@@ -183,16 +217,21 @@ def speaker_labels(words: list[dict]) -> dict:
 
 
 def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_ms: int = 2500,
-                  speakers: dict | None = None) -> list[str]:
+                  speakers: dict | None = None, stamp_every_s: int = 0) -> list[str]:
     """Render words to paragraphs.
 
     A pause longer than ``pause_ms`` starts a new paragraph. With ``speakers`` (from
     ``speaker_labels``), a change of speaker also starts one, prefixed with ``**label:**``.
+    With ``stamp_every_s``, a paragraph that starts at least that long after the previous
+    time stamp gets its time (``[mm:ss]``, or ``[h:mm:ss]`` in recordings of an hour or more).
+    Runs of the same word (``REPEAT_MIN`` or more) are collapsed to ``[?: word ×N]``.
     """
     speakers = speakers or {}
     blocks: list[list[str]] = [[]]
     prefixes: list[str] = [""]
+    starts: list[int | None] = [None]
     current = None
+    loops = repetition_runs(words)
 
     def speaker_of(word: dict):
         spk = word.get("speaker")
@@ -206,6 +245,7 @@ def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_m
             if blocks[-1]:
                 blocks.append([])
                 prefixes.append("")
+                starts.append(None)
             prefixes[-1] = f"**{speakers[spk]['label']}:** "
             current = spk
         elif i > 0 and blocks[-1]:
@@ -213,6 +253,15 @@ def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_m
             if prev_end is not None and start is not None and start - prev_end > pause_ms:
                 blocks.append([])
                 prefixes.append("")
+                starts.append(None)
+        if starts[-1] is None and word.get("start_ms") is not None:
+            starts[-1] = word["start_ms"]
+        if i in loops:
+            group = words[i: loops[i]]
+            body, tail = _split_trailing(group[-1]["text"])
+            blocks[-1].append(f"[?: {body} ×{len(group)}]{tail}")
+            i = loops[i]
+            continue
         if word.get("span"):
             span = word["span"]
             group = words[i: i + max(span.get("n", 1), 1)]
@@ -227,7 +276,7 @@ def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_m
             j = i
             while (j < n and _is_uncertain(words[j], threshold)
                    and not words[j].get("insert_after") and not words[j].get("insert_before")
-                   and (j == i or speaker_of(words[j]) in (None, spk))):
+                   and (j == i or speaker_of(words[j]) in (None, spk)) and (j == i or j not in loops)):
                 j += 1
             run = words[i:j]
             if len(run) >= run_min:
@@ -240,13 +289,22 @@ def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_m
             continue
         blocks[-1].append(_with_inserts(word, render_word(word, threshold)))
         i += 1
-    return [prefix + " ".join(b) for prefix, b in zip(prefixes, blocks) if b]
+    stamps = [""] * len(blocks)
+    if stamp_every_s and words:
+        long_form = (words[-1].get("end_ms") or 0) >= 3_600_000
+        last = 0
+        for k, start in enumerate(starts):
+            if start is not None and blocks[k] and start - last >= stamp_every_s * 1000:
+                stamps[k] = _clock(start, long_form) + " "
+                last = start
+    return [stamp + prefix + " ".join(b) for stamp, prefix, b in zip(stamps, prefixes, blocks) if b]
 
 
 def stats(words: list[dict], threshold: float) -> dict:
     """Counts and an overall certainty level (share of marked words)."""
     total = len(words)
-    uncertain = sum(1 for w in words if _is_uncertain(w, threshold))
+    repeated = {k for a, b in repetition_runs(words).items() for k in range(a, b)}
+    uncertain = sum(1 for k, w in enumerate(words) if _is_uncertain(w, threshold) or k in repeated)
     alternatives = sum(1 for w in words if _has_alternative(w))
     inserts = sum(len(w.get("insert_after", [])) + len(w.get("insert_before", [])) for w in words)
     share = (uncertain + alternatives) / total if total else 0.0

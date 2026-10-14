@@ -111,6 +111,7 @@ class Worker:
                  second_reader: SecondReader | None = None, embedder=None, audio_loader=None):
         self.cfg = cfg
         self.store = store or Store(cfg.data_dir, cfg.output_dir)
+        self.store.stamp_every_s = cfg.timestamp_every_s
         self._transcriber = transcriber
         self._second_reader = second_reader
         self._embedder = embedder

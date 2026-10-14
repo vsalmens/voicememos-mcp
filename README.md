@@ -42,6 +42,8 @@ The worker runs when the recordings folder or the queue changes, and every 30 mi
 | `{a\|b}` | two engines heard different things: primary engine first, second reader after |
 | `{a b\|∅}`, `{∅\|b}` | only one of the engines heard something here |
 | `[?]` | something was said, nothing usable was recognised |
+| `[?: word ×N]` | the engine produced the same word N times in a row (4+), usually a loop over music or noise; JSON flag `repetition` |
+| `[12:34]` / `[1:02:03]` | time in the recording at the start of a paragraph, at most once a minute (`VOICEMEMOS_TIMESTAMP_EVERY_S`) |
 
 This follows conversation-analysis (Jefferson) practice, where `(word)` marks an
 uncertain hearing, `(a)/(b)` alternative hearings and `( )` unhearable talk.

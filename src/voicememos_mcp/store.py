@@ -64,6 +64,7 @@ class Store:
     def __init__(self, data_dir: Path, output_dir: Path):
         self.data_dir = data_dir
         self.output_dir = output_dir
+        self.stamp_every_s = 0  # paragraph time stamps in the Markdown files (set from config)
 
     # ---- paths
     @property
@@ -158,7 +159,7 @@ class Store:
             if old.with_suffix("") != base and old.suffix in (".md", ".json"):
                 old.unlink(missing_ok=True)
         write_json_atomic(json_path, data)
-        md_path.write_text(render_markdown(data, threshold, run_min, pause_ms), encoding="utf-8")
+        md_path.write_text(render_markdown(data, threshold, run_min, pause_ms, self.stamp_every_s), encoding="utf-8")
         return {
             "json": str(json_path.relative_to(self.output_dir)),
             "markdown": str(md_path.relative_to(self.output_dir)),
@@ -179,7 +180,8 @@ class Store:
         data["words"] = notation.annotate(words, threshold)
         data["updated"] = now_iso()
         write_json_atomic(json_path, data)
-        json_path.with_suffix(".md").write_text(render_markdown(data, threshold, run_min, pause_ms), encoding="utf-8")
+        json_path.with_suffix(".md").write_text(render_markdown(data, threshold, run_min, pause_ms, self.stamp_every_s),
+                                                encoding="utf-8")
         return {"json": relative_json, "markdown": str(json_path.with_suffix(".md").relative_to(self.output_dir.resolve())),
                 "stats": data["stats"], "markers": data["markers"]}
 
@@ -224,11 +226,12 @@ class Store:
         return [j for j in (read_json(p) for p in paths[:limit]) if j]
 
 
-def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: int = 2500) -> str:
+def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: int = 2500,
+                    stamp_every_s: int = 0) -> str:
     memo = data["memo"]
     words = data.get("words", [])
     s = notation.stats(words, threshold)
-    blocks = notation.render_blocks(words, threshold, run_min, pause_ms, data.get("speakers"))
+    blocks = notation.render_blocks(words, threshold, run_min, pause_ms, data.get("speakers"), stamp_every_s)
     text = "\n\n".join(blocks)
     markers = data.get("markers", [])
     title = memo.get("title") or "Voice memo"

@@ -38,6 +38,7 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_CONF_THRESHOLD": "0.70",
     "VOICEMEMOS_RUN_MIN": "4",
     "VOICEMEMOS_PAUSE_MS": "2500",
+    "VOICEMEMOS_TIMESTAMP_EVERY_S": "60",
     "VOICEMEMOS_EXCLUDE_TITLE_REGEX": "",
     "VOICEMEMOS_EXCLUDE_FOLDERS": "",
     "VOICEMEMOS_AUTO_TRANSCRIBE": "1",
@@ -167,6 +168,10 @@ class Config:
     @property
     def pause_ms(self) -> int:
         return int(self.get("VOICEMEMOS_PAUSE_MS"))
+
+    @property
+    def timestamp_every_s(self) -> int:
+        return max(0, int(self.get("VOICEMEMOS_TIMESTAMP_EVERY_S") or 0))
 
     @property
     def markers(self) -> dict[str, str]:
