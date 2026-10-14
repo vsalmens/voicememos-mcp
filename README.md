@@ -39,7 +39,8 @@ The worker runs when the recordings folder or the queue changes, and every 30 mi
 |---|---|
 | `word (?)` | best guess, confidence below the threshold |
 | `[?: w1 w2 w3 w4]` | several consecutive uncertain words (guesses kept) |
-| `{a\|b}` | two plausible readings, more likely first (multi-engine, planned) |
+| `{a\|b}` | two engines heard different things: primary engine first, second reader after |
+| `{a b\|∅}`, `{∅\|b}` | only one of the engines heard something here |
 | `[?]` | something was said, nothing usable was recognised |
 
 This follows conversation-analysis (Jefferson) practice, where `(word)` marks an
@@ -56,6 +57,28 @@ The semantics match PAGE XML (`TextEquiv@conf`, alternatives ranked by `index`) 
 exported to TEI (`<unclear cert>`, `<choice>`) or ALTO (`WC`, `ALTERNATIVE`). No existing
 standard keeps everything a speech engine returns (sub-word tokens, per-token language,
 timings), which is why the raw response is stored as well.
+
+## Second reader
+
+Gemini models return text without word confidence, so they cannot drive the `(?)` marks.
+They are useful as an independent second reader: where two engines disagree, at least one is
+wrong. `voicememos-mcp second-read` (or the `voicememos_second_read` tool) sends the audio
+of already transcribed memos to a Gemini model (default `gemini-4-argon`), aligns its text
+with the primary words and marks the differences as `{a|b}`. The primary engine is not
+called again, and the raw second text is kept in the JSON (`readers`).
+
+`voicememos-mcp report` (or `voicememos_compare_readers`) compares the readers **per
+language** (Soniox's language tags decide whether a memo is Finnish, English or mixed):
+
+* word agreement and difference rate,
+* disagreements per 100 words,
+* calibration: how many disagreements fall on words the primary engine already marked
+  uncertain, and how many uncertain words the second reader confirmed,
+* a random sample of disagreements with time offsets, as a listening checklist. Agreement
+  says nothing about who is right; listening does.
+
+The alignment is a word-level sequence diff that ignores case and punctuation. Different
+word splitting (compounds, numbers written as digits or words) shows up as disagreement.
 
 Transcripts start with a short reading guide that asks language models not to present
 marked words as certain, and to propose corrections visibly (`word→suggestion (?)`).
@@ -120,6 +143,8 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
 | `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence |
+| `VOICEMEMOS_SECOND_READER` | | `gemini` = second reading for every new memo |
+| `VOICEMEMOS_SECOND_READER_MODEL` | `gemini-4-argon` | |
 | `VOICEMEMOS_ROAM_ENABLED` | `0` | append new transcripts to Roam daily notes |
 
 Excluded memos are never transcribed, and the MCP tools cannot see them, not even their
@@ -135,6 +160,8 @@ titles.
 | `voicememos_search` | case-insensitive search (or regex) over transcripts and titles, with snippets |
 | `voicememos_markers` | sentences tagged with a spoken marker ("Idea: ...") across memos |
 | `voicememos_transcribe` | queue memos (by id or date range) for background transcription; returns a job id |
+| `voicememos_second_read` | queue an independent Gemini reading of transcribed memos |
+| `voicememos_compare_readers` | per-language comparison of the readers, with a listening checklist |
 | `voicememos_transcribe_status` | job progress, or recent jobs |
 
 Memo status values: `transcribed`, `pending` (will be transcribed automatically),
@@ -149,6 +176,8 @@ voicememos-mcp check                         # paths, permissions, keys
 voicememos-mcp sync --dry-run --limit 1      # one memo, print only, save nothing
 voicememos-mcp sync --memo 1a2b3c4d --redo   # transcribe one memo again
 voicememos-mcp transcribe-file memo.m4a --threshold 0.6 --threshold 0.8   # calibration
+voicememos-mcp second-read --since 2026-01-01 --limit 20   # add the second reader
+voicememos-mcp report                        # compare readers per language
 voicememos-mcp launchd-plist                 # print the launchd job definition
 ```
 
@@ -162,6 +191,8 @@ transcripts without new API calls.
 
 ## Privacy and security
 
+* With the second reader, audio also goes to the Gemini API. Large files uploaded through
+  the Files API are deleted right after the request.
 * Audio goes to Soniox for transcription. The uploaded file and the transcription are
   deleted from Soniox right after the transcript is fetched, also when something fails.
   Soniox offers an EU endpoint (`SONIOX_BASE_URL=https://api.eu.soniox.com`), which needs an
@@ -184,7 +215,7 @@ transcripts without new API calls.
 
 ## Roadmap
 
-* Second engine and disagreement marking (`{a|b}`, `basis: reader_disagreement`).
+* Adjudication: a third pass that listens to the disputed segment and picks a reading.
 * Export to TEI (spoken text) and WebVTT.
 
 ## Development

@@ -7,7 +7,7 @@ Settings come from three places, later ones overriding earlier ones:
    (override the path with ``VOICEMEMOS_CONFIG``),
 3. environment variables.
 
-Secrets (``SONIOX_API_KEY``, ``ROAM_API_TOKEN``) are read from the environment or,
+Secrets (``SONIOX_API_KEY``, ``GEMINI_API_KEY``, ``ROAM_API_TOKEN``) are read from the environment or,
 on macOS, from the login Keychain (service ``voicememos-mcp``, account = variable
 name). They are never written to disk by this package.
 """
@@ -50,13 +50,16 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_LAUNCHD_LABEL": "local.voicememos-mcp.sync",
     "SONIOX_BASE_URL": "https://api.soniox.com",
     "SONIOX_MODEL": "stt-async-v5",
+    "VOICEMEMOS_SECOND_READER": "",
+    "VOICEMEMOS_SECOND_READER_MODEL": "gemini-4-argon",
+    "VOICEMEMOS_SECOND_READER_MAX_MIN": "60",
     "VOICEMEMOS_ROAM_ENABLED": "0",
     "VOICEMEMOS_ROAM_BACKFILL": "0",
     "ROAM_GRAPH": "",
     "VOICEMEMOS_ROAM_HEADING": "🎙️ Voice memo {time} ({duration}) #voicememo {stats}{title}",
 }
 
-PREFIXES = ("VOICEMEMOS_", "SONIOX_", "ROAM_")
+PREFIXES = ("VOICEMEMOS_", "SONIOX_", "ROAM_", "GEMINI_")
 
 
 def default_config_path() -> Path:

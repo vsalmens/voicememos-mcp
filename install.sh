@@ -4,7 +4,8 @@
 #   1. MCP server      -> uv tool (~/.local/bin/voicememos-mcp), used by Claude Desktop
 #   2. worker          -> its own virtualenv, run by launchd; the only part that reads Voice Memos
 #   3. configuration   -> ~/.config/voicememos-mcp/config.env (created from the example if missing)
-#   4. secrets         -> macOS Keychain, service "voicememos-mcp" (never written to a file)
+#   4. secrets         -> macOS Keychain, service "voicememos-mcp" (never written to a file):
+#                         SONIOX_API_KEY, plus GEMINI_API_KEY / ROAM_API_TOKEN when those features are on
 #   5. Claude Desktop  -> adds a "voicememos" entry to claude_desktop_config.json (backup kept)
 #
 # Options:  --no-claude-config   do not touch the Claude Desktop config
@@ -76,6 +77,8 @@ store_secret() {
 }
 store_secret SONIOX_API_KEY
 [ "$ROAM_ENABLED" = "1" ] && store_secret ROAM_API_TOKEN
+store_secret GEMINI_API_KEY   # optional: only needed for the second reader
+true
 
 if [ "$DO_LAUNCHD" = "1" ]; then
   echo "== 5/6 launchd worker ($LABEL)"

@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import notation, roam
+from . import align, notation, roam
 from .audio import prepare_audio
 from .config import Config
 from .library import LibraryError, Memo, is_excluded, read_library
@@ -32,6 +32,7 @@ from .store import Store, now_iso
 log = logging.getLogger(__name__)
 
 Transcriber = Callable[[Path], list[dict]]
+SecondReader = Callable[[Path], dict]
 
 
 class Busy(RuntimeError):
@@ -63,6 +64,21 @@ def soniox_transcriber(cfg: Config) -> Transcriber:
     return transcribe
 
 
+def gemini_reader(cfg: Config, model: str | None = None) -> SecondReader:
+    from .gemini import Gemini, build_prompt
+
+    key = cfg.secret("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY is not set (environment or Keychain)")
+    client = Gemini(key, model or cfg.get("VOICEMEMOS_SECOND_READER_MODEL"))
+    prompt = build_prompt(cfg.languages, cfg.context_terms, cfg.context_text)
+
+    def read(audio: Path) -> dict:
+        return client.transcribe(audio, prompt)
+
+    return read
+
+
 def _fingerprint(path: Path) -> str:
     st = path.stat()
     return f"{st.st_size}:{int(st.st_mtime)}"
@@ -79,10 +95,12 @@ def _in_range(memo: Memo, since: str | None, until: str | None) -> bool:
 
 class Worker:
     def __init__(self, cfg: Config, store: Store | None = None, transcriber: Transcriber | None = None,
-                 roam_session=None, clock: Callable[[], float] = time.time):
+                 roam_session=None, clock: Callable[[], float] = time.time,
+                 second_reader: SecondReader | None = None):
         self.cfg = cfg
         self.store = store or Store(cfg.data_dir, cfg.output_dir)
         self._transcriber = transcriber
+        self._second_reader = second_reader
         self.roam_session = roam_session
         self.clock = clock
         self.state: dict = {}
@@ -93,6 +111,36 @@ class Worker:
         if self._transcriber is None:
             self._transcriber = soniox_transcriber(self.cfg)
         return self._transcriber
+
+    def second_reader(self, model: str | None = None, on_demand: bool = False) -> SecondReader | None:
+        """The reader used after each new transcription (``VOICEMEMOS_SECOND_READER=gemini``), or,
+        with ``on_demand``, for explicit second-read requests even when automatic reading is off."""
+        if self._second_reader is not None and model is None:
+            return self._second_reader
+        if model or on_demand or self.cfg.get("VOICEMEMOS_SECOND_READER") == "gemini":
+            reader = gemini_reader(self.cfg, model)
+            if model is None:
+                self._second_reader = reader
+            return reader
+        return None
+
+    def _apply_second_reader(self, reader: SecondReader, audio: Path, memo: Memo, words: list[dict]) -> tuple[list[dict], dict]:
+        """Run the second reader and align it. Returns (words, reader_record). Never raises."""
+        record: dict = {"role": "second", "provider": "gemini", "created": now_iso()}
+        max_s = float(self.cfg.get("VOICEMEMOS_SECOND_READER_MAX_MIN")) * 60
+        if memo.duration_s and memo.duration_s > max_s:
+            record["error"] = f"skipped: longer than {max_s / 60:.0f} min"
+            return words, record
+        try:
+            result = reader(audio)
+            aligned, metrics = align.align(words, result["text"], self.cfg.threshold)
+            record.update(model=result.get("model"), text=result["text"], usage=result.get("usage", {}),
+                          finish_reason=result.get("finish_reason"), agreement=metrics)
+            return aligned, record
+        except Exception as exc:  # noqa: BLE001 - the primary transcript must survive
+            log.exception("Second reader failed for %s", memo.id)
+            record["error"] = str(exc)[:300]
+            return words, record
 
     def _excluded(self, memo: Memo) -> bool:
         return is_excluded(memo, self.cfg.exclude_title_regex, self.cfg.exclude_folders)
@@ -123,7 +171,8 @@ class Worker:
             item = memo.to_dict()
             item["status"] = self._status(memo)
             if entry.get("ok"):
-                item["transcript"] = {k: entry.get(k) for k in ("json", "markdown", "stats", "markers", "at")}
+                item["transcript"] = {k: entry.get(k) for k in ("json", "markdown", "stats", "markers", "at",
+                                                                "language", "second_reader")}
             elif entry.get("error"):
                 item["error"] = entry["error"]
             items.append(item)
@@ -149,9 +198,14 @@ class Worker:
             return {**item, "status": "already_transcribed", "markdown": entry.get("markdown")}
 
         try:
+            second_record = None
             with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
-                tokens = self.transcriber(prepare_audio(path, Path(tmp)))
-            words, had_confidence = notation.tokens_to_words(tokens)
+                audio = prepare_audio(path, Path(tmp))
+                tokens = self.transcriber(audio)
+                words, had_confidence = notation.tokens_to_words(tokens)
+                reader = None if dry_run else self.second_reader()
+                if reader is not None:
+                    words, second_record = self._apply_second_reader(reader, audio, memo, words)
             if dry_run:
                 text = "\n\n".join(notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min,
                                                           self.cfg.pause_ms))
@@ -159,10 +213,17 @@ class Worker:
                         "text": text, "confidence_available": had_confidence}
             engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
                       "language_hints": self.cfg.languages}
+            extra = {"language": align.dominant_language(words),
+                     "readers": [{"role": "primary", **engine, "created": now_iso()}]
+                     + ([second_record] if second_record else [])}
             result = self.store.write_transcript(
                 memo.to_dict(), words, engine, had_confidence, self.cfg.threshold,
-                self.cfg.run_min, self.cfg.pause_ms, self.cfg.markers, source_tokens=tokens,
+                self.cfg.run_min, self.cfg.pause_ms, self.cfg.markers, source_tokens=tokens, extra=extra,
             )
+            result["language"] = extra["language"]
+            if second_record and not second_record.get("error"):
+                result["second_reader"] = {"model": second_record.get("model"),
+                                           "agreement": second_record["agreement"]["agreement"]}
             new_entry = {"fp": fingerprint, "ok": True, "at": now_iso(), **result}
             if entry.get("roam"):
                 new_entry["roam"] = entry["roam"]
@@ -178,6 +239,46 @@ class Worker:
                                        "attempts": entry.get("attempts", 0) + 1, "error": str(exc)[:300],
                                        "at": now_iso()}
             return {**item, "status": "failed", "error": str(exc)[:300]}
+
+    def second_read_memo(self, memo: Memo, model: str | None = None, redo: bool = False) -> dict:
+        """Add a second reader to an existing transcript without calling the primary engine again."""
+        item = {"id": memo.id, "short_id": memo.short_id, "title": memo.title, "recorded": memo.recorded}
+        entry = self.state.get(memo.id, {})
+        if self._excluded(memo) or memo.deleted:
+            return {**item, "status": "skipped"}
+        if not entry.get("ok"):
+            return {**item, "status": "not_transcribed", "error": "transcribe it first"}
+        data = self.store.load_transcript(entry["json"])
+        if data is None:
+            return {**item, "status": "failed", "error": "transcript file missing"}
+        if not redo and any(r.get("role") == "second" and not r.get("error") for r in data.get("readers", [])):
+            return {**item, "status": "already_read", "markdown": entry.get("markdown")}
+        if not memo.local or not memo.filename:
+            return {**item, "status": "not_downloaded"}
+        try:
+            reader = self.second_reader(model, on_demand=True)
+            if reader is None:
+                return {**item, "status": "failed", "error": "no second reader configured"}
+            with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+                audio = prepare_audio(self.cfg.recordings_dir / memo.filename, Path(tmp))
+                words, record = self._apply_second_reader(reader, audio, memo, data.get("words", []))
+        except Exception as exc:  # noqa: BLE001
+            return {**item, "status": "failed", "error": str(exc)[:300]}
+        if record.get("error"):
+            return {**item, "status": "failed", "error": record["error"]}
+        readers = [r for r in data.get("readers", []) if r.get("role") != "second"] + [record]
+        if not any(r.get("role") == "primary" for r in readers):
+            readers.insert(0, {"role": "primary", **data.get("engine", {})})
+        data["readers"] = readers
+        data["words"] = words
+        data.setdefault("language", align.dominant_language(words))
+        result = self.store.rewrite_transcript(entry["json"], data, self.cfg.threshold, self.cfg.run_min,
+                                               self.cfg.pause_ms, self.cfg.markers)
+        entry.update(stats=result["stats"], markers=result["markers"], language=data["language"])
+        entry["second_reader"] = {"model": record.get("model"), "agreement": record["agreement"]["agreement"],
+                                  "at": record["created"]}
+        self.state[memo.id] = entry
+        return {**item, "status": "second_read", "agreement": record["agreement"], "markdown": result["markdown"]}
 
     def _push_roam(self, memo: Memo, words: list[dict], result: dict, entry: dict, item: dict) -> None:
         graph, token = self.cfg.get("ROAM_GRAPH"), self.cfg.secret("ROAM_API_TOKEN")
@@ -222,15 +323,27 @@ class Worker:
             job = self.store.read_job(request_doc["job_id"]) or request_doc
             request = job.get("request", {})
             targets = self._resolve_request(request, memos)
+            if request.get("action") == "second_read":
+                targets = [m for m in targets if self.state.get(m.id, {}).get("ok")]
+                if not request.get("redo"):
+                    targets = [m for m in targets if not self.state[m.id].get("second_reader")]
+            if request.get("limit"):
+                targets = targets[: int(request["limit"])]
             job.update(status="running", started=now_iso(), total=len(targets), done=0, failed=0, items=[])
             self.store.write_job(job)
             push = bool(request.get("push_roam")) or self.cfg.flag("VOICEMEMOS_ROAM_BACKFILL")
+            second = request.get("action") == "second_read"
             for memo in targets:
-                item = self.transcribe_memo(memo, force=bool(request.get("redo")), push_roam=push)
+                if second:
+                    item = self.second_read_memo(memo, request.get("model"), bool(request.get("redo")))
+                else:
+                    item = self.transcribe_memo(memo, force=bool(request.get("redo")), push_roam=push)
                 job["items"].append({k: item.get(k) for k in ("short_id", "title", "recorded", "status",
                                                              "error", "markdown")})
                 job["done"] += 1
                 job["failed"] += item["status"] == "failed"
+                if second and item.get("agreement"):
+                    job["items"][-1]["agreement"] = item["agreement"].get("agreement")
                 self.store.write_job(job)
                 self.store.write_state(self.state)
             job.update(status="done", finished=now_iso())
@@ -262,6 +375,30 @@ class Worker:
             out.append(memo)
         out.sort(key=lambda m: m.recorded or "")
         return out
+
+    # ------------------------------------------------------------------ second reader batch
+    def run_second_read(self, only: list[str] | None = None, since: str | None = None, until: str | None = None,
+                        limit: int | None = None, model: str | None = None, redo: bool = False) -> dict:
+        """Add the second reader to existing transcripts (synchronously, under the worker lock)."""
+        self.store.ensure_dirs()
+        try:
+            with single_instance(self.store.data_dir / "worker.lock"):
+                self.state = self.store.read_state()
+                memos = read_library(self.cfg.recordings_dir)
+                request = {"memos": only or [], "since": since, "until": until, "all": not (only or since or until)}
+                targets = [m for m in self._resolve_request(request, memos) if self.state.get(m.id, {}).get("ok")]
+                items = []
+                for memo in targets:
+                    if limit and sum(1 for i in items if i["status"] == "second_read") >= limit:
+                        break
+                    items.append(self.second_read_memo(memo, model, redo))
+                    self.store.write_state(self.state)
+                self.store.write_library(self._snapshot(memos))
+                return {"ok": True, "items": items}
+        except Busy as exc:
+            return {"ok": False, "error": str(exc)}
+        except LibraryError as exc:
+            return {"ok": False, "error": str(exc)}
 
     # ------------------------------------------------------------------ run
     def run(self, dry_run: bool = False, limit: int | None = None, only: list[str] | None = None,

@@ -42,6 +42,40 @@ def cmd_sync(args) -> int:
     return 0 if summary.get("ok") else 1
 
 
+def cmd_second_read(args) -> int:
+    from .worker import Worker
+
+    cfg = load_config()
+    if args.queue:
+        from .tools import Tools
+
+        since = args.since or ("1970-01-01" if not args.memo else None)
+        print(json.dumps(Tools(cfg).second_read(args.memo, since, args.until, args.model, args.redo, args.limit),
+                         indent=1))
+        return 0
+    summary = Worker(cfg).run_second_read(only=args.memo, since=args.since, until=args.until, limit=args.limit,
+                                          model=args.model, redo=args.redo)
+    for item in summary.get("items", []):
+        agreement = (item.get("agreement") or {}).get("agreement")
+        extra = f" agreement {agreement:.2f}" if agreement is not None else f" {item.get('error') or ''}"
+        print(f"{item.get('recorded', '')[:16]}  {item['short_id']}  {item['status']}{extra}  {item.get('title') or ''}")
+    if not summary.get("ok"):
+        print(summary.get("error"), file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_report(args) -> int:
+    from .report import build_report, write_report
+    from .store import Store
+
+    cfg = load_config()
+    store = Store(cfg.data_dir, cfg.output_dir)
+    paths = write_report(store, build_report(store, args.since, args.until, args.samples))
+    print(paths["markdown"])
+    return 0
+
+
 def cmd_check(_args) -> int:
     cfg = load_config()
     ok = True
@@ -64,6 +98,12 @@ def cmd_check(_args) -> int:
     ok &= bool(key)
     print(f"Soniox:         {cfg.get('SONIOX_BASE_URL')} model {cfg.get('SONIOX_MODEL')} languages {cfg.languages}")
     print(f"ffmpeg:         {find_tool('ffmpeg') or '(not found; afconvert is used for .qta)'}")
+    reader = cfg.get("VOICEMEMOS_SECOND_READER")
+    gemini_key = cfg.secret("GEMINI_API_KEY")
+    print(f"second reader:  {reader or 'off'} ({cfg.get('VOICEMEMOS_SECOND_READER_MODEL')}), "
+          f"Gemini key {'found' if gemini_key else 'missing'}")
+    if reader:
+        ok &= bool(gemini_key)
     if cfg.flag("VOICEMEMOS_ROAM_ENABLED"):
         token = cfg.secret("ROAM_API_TOKEN")
         roam_ok = bool(token and cfg.get("ROAM_GRAPH"))
@@ -139,6 +179,21 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("check", help="check paths, permissions and keys")
 
+    p = sub.add_parser("second-read", help="add the second reader (Gemini) to existing transcripts")
+    p.add_argument("--memo", action="append", help="only this memo id (repeatable)")
+    p.add_argument("--since", help="memos recorded on or after YYYY-MM-DD")
+    p.add_argument("--until", help="memos recorded on or before YYYY-MM-DD")
+    p.add_argument("--limit", type=int, help="at most N memos")
+    p.add_argument("--model", help="model id (default VOICEMEMOS_SECOND_READER_MODEL)")
+    p.add_argument("--redo", action="store_true", help="read again even if already read")
+    p.add_argument("--queue", action="store_true",
+                   help="hand the request to the launchd worker (use when this shell lacks Full Disk Access)")
+
+    p = sub.add_parser("report", help="compare the readers, per language; writes OUTPUT_DIR/_reports/")
+    p.add_argument("--since")
+    p.add_argument("--until")
+    p.add_argument("--samples", type=int, default=15, help="disagreements to sample per language")
+
     p = sub.add_parser("transcribe-file", help="transcribe one audio file and print it (nothing saved)")
     p.add_argument("file")
     p.add_argument("--threshold", type=float, action="append", help="render with this threshold (repeatable)")
@@ -153,7 +208,8 @@ def main(argv: list[str] | None = None) -> int:
     if platform.system() != "Darwin" and args.command in (None, "serve"):
         logging.getLogger(__name__).warning("Voice Memos is a macOS app; only transcripts can be served here")
     handlers = {None: cmd_serve, "serve": cmd_serve, "sync": cmd_sync, "check": cmd_check,
-                "transcribe-file": cmd_transcribe_file, "launchd-plist": cmd_launchd_plist}
+                "transcribe-file": cmd_transcribe_file, "launchd-plist": cmd_launchd_plist,
+                "second-read": cmd_second_read, "report": cmd_report}
     return handlers[args.command](args)
 
 

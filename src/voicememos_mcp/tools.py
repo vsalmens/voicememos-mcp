@@ -237,6 +237,33 @@ class Tools:
         return {"job_id": job_id, "status": "queued", "worker": started_by,
                 "hint": "check progress with voicememos_transcribe_status"}
 
+    def second_read(self, memos: list[str] | None = None, since: str | None = None, until: str | None = None,
+                    model: str | None = None, redo: bool = False, limit: int | None = None) -> dict:
+        memos = [m for m in (memos or []) if m and m.strip()]
+        since, until = _check_date(since, "since"), _check_date(until, "until")
+        if not memos and not since and not until:
+            raise ToolError("give memo ids, or a date range (since/until)")
+        if model and not re.fullmatch(r"[A-Za-z0-9._-]{3,80}", model):
+            raise ToolError("invalid model id")
+        request = {"action": "second_read", "memos": [self._find(m)["id"] for m in memos], "since": since,
+                   "until": until, "model": model, "redo": bool(redo),
+                   "limit": max(1, int(limit)) if limit else None}
+        self.store.ensure_dirs()
+        job_id = self.store.enqueue(request)
+        return {"job_id": job_id, "status": "queued", "worker": self._kick_worker(),
+                "hint": "check progress with voicememos_transcribe_status, then voicememos_compare_readers"}
+
+    def compare_readers(self, since: str | None = None, until: str | None = None, samples: int = 15) -> dict:
+        from .report import build_report, write_report
+
+        report = build_report(self.store, _check_date(since, "since"), _check_date(until, "until"),
+                              max(0, min(int(samples), 50)))
+        paths = write_report(self.store, report)
+        summary = {lang: {k: v for k, v in group.items() if k != "samples"}
+                   for lang, group in report["languages"].items()}
+        return {"languages": summary, "report_file": paths["markdown"],
+                "samples": {lang: group["samples"][:5] for lang, group in report["languages"].items()}}
+
     def _kick_worker(self) -> str:
         mode = self.cfg.get("VOICEMEMOS_WORKER")
         if mode == "inprocess":

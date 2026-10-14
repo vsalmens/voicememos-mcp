@@ -119,7 +119,7 @@ class Store:
 
     def write_transcript(self, memo: dict, words: list[dict], engine: dict, had_confidence: bool,
                          threshold: float, run_min: int, pause_ms: int, markers: dict[str, str],
-                         source_tokens: list[dict] | None = None) -> dict:
+                         source_tokens: list[dict] | None = None, extra: dict | None = None) -> dict:
         """Write the JSON (canonical) and Markdown (rendered) files. Returns relative paths.
 
         ``source_tokens`` is the engine's raw response, kept verbatim: it is the only
@@ -138,6 +138,8 @@ class Store:
             "markers": notation.extract_markers(text, markers),
             "words": notation.annotate(words, threshold),
         }
+        if extra:
+            data.update(extra)
         if source_tokens is not None:
             data["source_tokens"] = source_tokens
         json_path = base.with_suffix(".json")
@@ -154,6 +156,23 @@ class Store:
             "stats": data["stats"],
             "markers": data["markers"],
         }
+
+    def rewrite_transcript(self, relative_json: str, data: dict, threshold: float, run_min: int,
+                           pause_ms: int, markers: dict[str, str]) -> dict:
+        """Re-derive stats, markers and flags from ``data["words"]`` and rewrite both files in place."""
+        json_path = (self.output_dir / relative_json).resolve()
+        if self.output_dir.resolve() not in json_path.parents:
+            raise ValueError("transcript path outside the output directory")
+        words = data.get("words", [])
+        text = "\n\n".join(notation.render_blocks(words, threshold, run_min, pause_ms))
+        data["stats"] = notation.stats(words, threshold)
+        data["markers"] = notation.extract_markers(text, markers)
+        data["words"] = notation.annotate(words, threshold)
+        data["updated"] = now_iso()
+        write_json_atomic(json_path, data)
+        json_path.with_suffix(".md").write_text(render_markdown(data, threshold, run_min, pause_ms), encoding="utf-8")
+        return {"json": relative_json, "markdown": str(json_path.with_suffix(".md").relative_to(self.output_dir.resolve())),
+                "stats": data["stats"], "markers": data["markers"]}
 
     def load_transcript(self, relative_json: str) -> dict | None:
         path = (self.output_dir / relative_json).resolve()
@@ -228,6 +247,12 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
         f"> {notation.READER_NOTE}",
         "",
     ]
+    second = next((r for r in data.get("readers", []) if r.get("role") == "second" and not r.get("error")), None)
+    if second:
+        agreement = second.get("agreement", {}).get("agreement")
+        front += [f"> Second reader: {second.get('model')}, word agreement "
+                  f"{100 * agreement:.0f} %. `{{a|b}}` shows where the engines differ." if agreement is not None
+                  else f"> Second reader: {second.get('model')}.", ""]
     if not data.get("confidence_available"):
         front += ["> Warning: the engine returned no confidence values, so nothing is marked as uncertain.", ""]
     if markers:
