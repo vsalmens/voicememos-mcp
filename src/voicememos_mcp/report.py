@@ -85,7 +85,8 @@ def build_report(store: Store, since: str | None = None, until: str | None = Non
             data = {**data, "words": words}
             second = {**second, "agreement": metrics}
         elif second.get("text"):  # re-align with the current comparison rules (e.g. spoken-form folding)
-            words, metrics = align.align(data.get("words", []), second["text"], threshold)
+            words, metrics = align.align(data.get("words", []), second["text"], threshold,
+                                         second.get("finish_reason") in align.TRUNCATED)
             data = {**data, "words": words}
             second = {**second, "agreement": metrics}
         groups[data.get("language") or "unknown"].append({"memo": memo, "data": data, "second": second})

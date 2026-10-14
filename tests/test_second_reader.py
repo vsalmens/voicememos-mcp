@@ -318,3 +318,40 @@ def test_reading_that_does_not_match_is_rejected_and_old_marks_removed(cfg, fake
     data = json.loads(next(cfg.output_dir.rglob("*morning-walk_aaaa1111.json")).read_text())
     second = [r for r in data["readers"] if r["role"] == "second"][0]
     assert second["error"].startswith("rejected") and "Squats" in second["text"]
+
+
+def test_truncated_reading_leaves_the_rest_uncompared():
+    words = primary(["one", "two", "three", "four", "five", "six."])
+    out, m = align.align(words, "one two three", truncated=True)
+    assert render(out) == "one two three four five six."
+    assert m["uncovered_words"] == 3 and m["deleted"] == 0 and m["agreement"] == 1.0
+    _, full = align.align(words, "one two three")
+    assert full["deleted"] == 3
+
+
+def test_one_refused_part_does_not_lose_the_others(cfg, tmp_path):
+    from types import SimpleNamespace
+
+    from voicememos_mcp.gemini import GeminiError
+
+    words = long_words(70)
+    cut = align.plan_chunks(words, 30 * 60_000)[1]["first"]
+    calls = []
+
+    def cutter(audio, start_s, end_s, out):
+        out.write_text("clip")
+        return out
+
+    def reader(clip):
+        calls.append(clip.name)
+        if clip.name.startswith("part1"):
+            raise GeminiError("Gemini returned no candidates: {'blockReason': 'OTHER'}")
+        return {"text": " ".join(w["text"] for w in words[cut:]), "model": "gemini-4-argon",
+                "usage": {"totalTokenCount": 1}, "finish_reason": "STOP"}
+
+    worker = Worker(cfg, transcriber=None, second_reader=reader, audio_cutter=cutter)
+    audio = tmp_path / "long.m4a"
+    audio.write_text("x")
+    out, record = worker._apply_second_reader(reader, audio, SimpleNamespace(id="l", duration_s=4200), words)
+    assert "error" not in record and len(calls) == 2
+    assert record["chunks"][0]["failed"].startswith("Gemini") and record["agreement"]["chunks_read"] == 1

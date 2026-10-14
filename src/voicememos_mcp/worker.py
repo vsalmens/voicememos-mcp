@@ -165,7 +165,8 @@ class Worker:
         try:
             if not self.is_long(memo, words):
                 result = reader(audio)
-                aligned, metrics = align.align(words, result["text"], self.cfg.threshold)
+                aligned, metrics = align.align(words, result["text"], self.cfg.threshold,
+                                               result.get("finish_reason") in align.TRUNCATED)
                 record.update(model=result.get("model"), text=result["text"], usage=result.get("usage", {}),
                               finish_reason=result.get("finish_reason"), agreement=metrics)
                 if metrics["agreement"] < floor:
@@ -188,10 +189,16 @@ class Worker:
                     end_s = chunk["end_ms"] / 1000 if chunk["end_ms"] is not None else None
                     clip = self._cut_audio(audio, chunk["start_ms"] / 1000, end_s,
                                            Path(tmp) / f"part{k + 1}{audio.suffix or '.m4a'}")
-                    result = reader(clip)
+                    try:
+                        result = reader(clip)
+                    except Exception as exc:  # noqa: BLE001 - one refused part must not lose the others
+                        log.warning("Second reader failed for part %d of %s: %s", k + 1, memo.id, exc)
+                        chunk.update(text=None, failed=str(exc)[:200])
+                        continue
                     chunk.update(text=result["text"], finish_reason=result.get("finish_reason"))
                     _, part_metrics = align.align(words[chunk["first"]:chunk["last"]], result["text"],
-                                                  self.cfg.threshold)
+                                                  self.cfg.threshold,
+                                                  result.get("finish_reason") in align.TRUNCATED)
                     if part_metrics["agreement"] < floor:
                         chunk.update(text=None, rejected_text=result["text"],
                                      rejected=f"agreement {part_metrics['agreement']} below {floor}")
@@ -201,6 +208,9 @@ class Worker:
                 if any(c.get("rejected") for c in chunks):
                     record.update(chunks=chunks, error="rejected: no part matched the recording")
                     return align.strip_reader(words), record
+                if any(c.get("failed") for c in chunks):
+                    record["error"] = "every part failed: " + next(c["failed"] for c in chunks if c.get("failed"))
+                    return words, record
                 record["error"] = "skipped: no part with low certainty"
                 return words, record
             aligned, metrics = align.align_chunks(words, chunks, self.cfg.threshold)

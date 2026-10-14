@@ -197,6 +197,12 @@ its text is kept in the JSON with the reason. The floor is low on purpose: on ve
 recordings (loud music, a disguised voice) genuine readings agreed only 0.17–0.19 and were
 sometimes better than the primary engine. For long recordings the check is done per part.
 
+When the reader stops early (finish reason `RECITATION` – its copyright filter, typically
+triggered by music or radio in the background – or `MAX_TOKENS` and similar), the primary
+words after the end of its text are left uncompared instead of being marked `{word|∅}`. If
+the model refuses one part of a long recording, that part stays unread and the other parts
+are kept.
+
 Transcripts start with a short reading guide that asks language models not to present
 marked words as certain, and to propose corrections visibly (`word→suggestion (?)`).
 

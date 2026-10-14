@@ -87,8 +87,17 @@ def strip_reader(primary: list[dict]) -> list[dict]:
     return [{k: v for k, v in w.items() if k not in READER_FIELDS} for w in primary]
 
 
-def align(primary: list[dict], reader_text: str, threshold: float = 0.7) -> tuple[list[dict], dict]:
-    """Return primary words annotated with the reader's alternatives, plus agreement metrics."""
+# Finish reasons after which the reader's text stops early (e.g. RECITATION: the model's
+# copyright filter cut the answer, typically because of music or radio in the background).
+TRUNCATED = {"RECITATION", "MAX_TOKENS", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "OTHER"}
+
+
+def align(primary: list[dict], reader_text: str, threshold: float = 0.7,
+          truncated: bool = False) -> tuple[list[dict], dict]:
+    """Return primary words annotated with the reader's alternatives, plus agreement metrics.
+
+    With ``truncated`` the reader stopped early: primary words after the end of its text
+    are not compared (not marked, not counted) instead of showing up as "heard nothing"."""
     words = strip_reader(primary)
     other = reader_words(reader_text)
     memo_lang = dominant_language(words)
@@ -98,10 +107,15 @@ def align(primary: list[dict], reader_text: str, threshold: float = 0.7) -> tupl
     folded = sum(1 for w, k in zip(words, a) if normalise(w["text"]) != k) \
         + sum(1 for w, k in zip(other, b) if normalise(w["text"]) != k)
     matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    opcodes = matcher.get_opcodes()
+    uncovered = 0
+    if truncated and opcodes and opcodes[-1][0] == "delete" and opcodes[-1][2] == len(a):
+        uncovered = opcodes[-1][2] - opcodes[-1][1]
+        opcodes = opcodes[:-1]
 
     matched = substituted = deleted = inserted = spans = spans_low_conf = 0
     low_conf_agreed = low_conf_total = 0
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+    for tag, i1, i2, j1, j2 in opcodes:
         if tag == "equal":
             matched += i2 - i1
             for offset in range(i2 - i1):
@@ -136,11 +150,11 @@ def align(primary: list[dict], reader_text: str, threshold: float = 0.7) -> tupl
                 words[k]["in_span"] = True
         words[i1]["basis"] = "reader_disagreement"
 
-    for w in words:
+    for w in words[:len(words) - uncovered]:
         conf = w.get("conf")
         if conf is not None and conf < threshold:
             low_conf_total += 1
-    n_a, n_b = len(a), len(b)
+    n_a, n_b = len(a) - uncovered, len(b)
     metrics = {
         "primary_words": n_a,
         "reader_words": n_b,
@@ -157,6 +171,7 @@ def align(primary: list[dict], reader_text: str, threshold: float = 0.7) -> tupl
         "reader_unsure_marks": sum(1 for w in other if w.get("unsure")),
         "reader_gaps": sum(1 for w in other if w.get("gap")),
         "spoken_forms_folded": folded,
+        "uncovered_words": uncovered,
     }
     return words, metrics
 
@@ -172,7 +187,7 @@ SENTENCE_END = re.compile(r"[.!?…][\"'”’)\]]*$")
 COUNT_KEYS = ("primary_words", "reader_words", "matched", "substituted", "deleted", "inserted",
               "disagreement_spans", "spans_with_low_primary_confidence", "low_confidence_words",
               "low_confidence_words_confirmed_by_reader", "reader_unsure_marks", "reader_gaps",
-              "spoken_forms_folded")
+              "spoken_forms_folded", "uncovered_words")
 
 
 def plan_chunks(words: list[dict], chunk_ms: int, window_ms: int = 5 * 60_000) -> list[dict]:
@@ -220,7 +235,7 @@ def align_chunks(primary: list[dict], chunks: list[dict], threshold: float = 0.7
         if chunk.get("text") is None:
             words += part
             continue
-        aligned, metrics = align(part, chunk["text"], threshold)
+        aligned, metrics = align(part, chunk["text"], threshold, chunk.get("finish_reason") in TRUNCATED)
         words += aligned
         read += 1
         for key in COUNT_KEYS:
