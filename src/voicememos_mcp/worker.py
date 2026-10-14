@@ -161,12 +161,19 @@ class Worker:
         Long recordings are read in parts of about ``VOICEMEMOS_SECOND_READER_CHUNK_MIN``;
         with ``only_uncertain`` only parts whose primary transcript has low certainty."""
         record: dict = {"role": "second", "provider": "gemini", "created": now_iso()}
+        floor = float(self.cfg.get("VOICEMEMOS_SECOND_READER_MIN_AGREEMENT"))
         try:
             if not self.is_long(memo, words):
                 result = reader(audio)
                 aligned, metrics = align.align(words, result["text"], self.cfg.threshold)
                 record.update(model=result.get("model"), text=result["text"], usage=result.get("usage", {}),
                               finish_reason=result.get("finish_reason"), agreement=metrics)
+                if metrics["agreement"] < floor:
+                    # The reader wrote something that is not this recording (seen: a made-up
+                    # exercise plan). Keep its text for inspection, but do not mark anything.
+                    record["error"] = (f"rejected: agreement {metrics['agreement']} below {floor}; "
+                                       "the reader's text does not match the recording")
+                    return align.strip_reader(words), record
                 return aligned, record
             chunk_ms = int(float(self.cfg.get("VOICEMEMOS_SECOND_READER_CHUNK_MIN")) * 60_000)
             chunks = align.plan_chunks(words, chunk_ms)
@@ -183,9 +190,17 @@ class Worker:
                                            Path(tmp) / f"part{k + 1}{audio.suffix or '.m4a'}")
                     result = reader(clip)
                     chunk.update(text=result["text"], finish_reason=result.get("finish_reason"))
+                    _, part_metrics = align.align(words[chunk["first"]:chunk["last"]], result["text"],
+                                                  self.cfg.threshold)
+                    if part_metrics["agreement"] < floor:
+                        chunk.update(text=None, rejected_text=result["text"],
+                                     rejected=f"agreement {part_metrics['agreement']} below {floor}")
                     tokens += (result.get("usage") or {}).get("totalTokenCount", 0)
                     model = model or result.get("model")
             if not any(c.get("text") is not None for c in chunks):
+                if any(c.get("rejected") for c in chunks):
+                    record.update(chunks=chunks, error="rejected: no part matched the recording")
+                    return align.strip_reader(words), record
                 record["error"] = "skipped: no part with low certainty"
                 return words, record
             aligned, metrics = align.align_chunks(words, chunks, self.cfg.threshold)
@@ -477,7 +492,8 @@ class Worker:
             return {**item, "status": "failed", "error": str(exc)[:300]}
         if str(record.get("error", "")).startswith("skipped"):
             return {**item, "status": "skipped", "error": record["error"]}
-        if record.get("error"):
+        rejected = str(record.get("error", "")).startswith("rejected")
+        if record.get("error") and not rejected:
             return {**item, "status": "failed", "error": record["error"]}
         readers = [r for r in data.get("readers", []) if r.get("role") != "second"] + [record]
         if not any(r.get("role") == "primary" for r in readers):
@@ -489,6 +505,11 @@ class Worker:
                                                self.cfg.pause_ms, self.cfg.marker_spec)
         entry.update(stats=result["stats"], markers=result["markers"], language=data["language"],
                      speakers=len(data.get("speakers") or {}))
+        if rejected:
+            entry["second_reader"] = {"model": record.get("model"), "rejected": record["error"],
+                                      "at": record["created"]}
+            self.state[memo.id] = entry
+            return {**item, "status": "rejected", "error": record["error"], "markdown": result["markdown"]}
         entry["second_reader"] = {"model": record.get("model"), "agreement": record["agreement"]["agreement"],
                                   "at": record["created"]}
         self.state[memo.id] = entry

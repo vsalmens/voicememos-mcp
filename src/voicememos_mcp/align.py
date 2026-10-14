@@ -79,10 +79,17 @@ def dominant_language(words: list[dict], min_share: float = 0.8) -> str:
     return lang if count / sum(langs.values()) >= min_share else "mixed"
 
 
+READER_FIELDS = ("alts", "span", "in_span", "insert_after", "insert_before", "basis", "flag", "reader_unsure")
+
+
+def strip_reader(primary: list[dict]) -> list[dict]:
+    """Primary words without any second-reader annotations."""
+    return [{k: v for k, v in w.items() if k not in READER_FIELDS} for w in primary]
+
+
 def align(primary: list[dict], reader_text: str, threshold: float = 0.7) -> tuple[list[dict], dict]:
     """Return primary words annotated with the reader's alternatives, plus agreement metrics."""
-    words = [{k: v for k, v in w.items() if k not in ("alts", "span", "in_span", "insert_after", "basis",
-                                                      "flag", "reader_unsure")} for w in primary]
+    words = strip_reader(primary)
     other = reader_words(reader_text)
     memo_lang = dominant_language(words)
     reader_lang = "fi" if memo_lang == "fi" else None  # mixed memos: fold only the unambiguous forms

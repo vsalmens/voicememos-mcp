@@ -302,3 +302,19 @@ def test_on_demand_only_uncertain_skips_clear_memos(cfg, fake):
             assert item["status"] == "skipped" and item["error"].startswith("certainty")
     assert len(reader.calls) == sum(1 for i in summary["items"] if i["status"] == "second_read")
     assert summary["items"]
+
+
+def test_reading_that_does_not_match_is_rejected_and_old_marks_removed(cfg, fake):
+    Worker(cfg, transcriber=fake).run()
+    good = fake_reader()
+    Worker(cfg, transcriber=fake, second_reader=good).run_second_read(only=["aaaa1111"])
+    md = next(cfg.output_dir.rglob("*morning-walk_aaaa1111.md")).read_text()
+    assert "{bird|bed}" in md
+    made_up = fake_reader("Warm up for ten minutes. Squats: three sets of twelve. Plank thirty seconds.")
+    summary = Worker(cfg, transcriber=fake, second_reader=made_up).run_second_read(only=["aaaa1111"], redo=True)
+    assert summary["items"][0]["status"] == "rejected"
+    md = next(cfg.output_dir.rglob("*morning-walk_aaaa1111.md")).read_text()
+    assert "{" not in md.split("## Transcript", 1)[1]
+    data = json.loads(next(cfg.output_dir.rglob("*morning-walk_aaaa1111.json")).read_text())
+    second = [r for r in data["readers"] if r["role"] == "second"][0]
+    assert second["error"].startswith("rejected") and "Squats" in second["text"]
