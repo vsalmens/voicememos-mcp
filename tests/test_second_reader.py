@@ -285,3 +285,20 @@ def test_long_memo_read_in_parts_only_uncertain(cfg, tmp_path):
     assert len(out) == len(words) and out[first_cut + 1]["alts"] == ["bravo"]
     out_all, record_all = worker._apply_second_reader(reader, audio, memo, words, only_uncertain=False)
     assert len(reads) == 3 and record_all["agreement"]["chunks_read"] == 2
+
+
+def test_on_demand_only_uncertain_skips_clear_memos(cfg, fake):
+    Worker(cfg, transcriber=fake).run()
+    reader = fake_reader()
+    summary = Worker(cfg, transcriber=fake, second_reader=reader).run_second_read(since="2000-01-01",
+                                                                                  only_uncertain=True)
+    library = json.loads((cfg.data_dir / "library.json").read_text())
+    certainty = {m["short_id"]: (m.get("transcript") or {}).get("stats", {}).get("certainty")
+                 for m in library["memos"]}
+    for item in summary["items"]:
+        if certainty.get(item["short_id"]) == "low":
+            assert item["status"] == "second_read"
+        else:
+            assert item["status"] == "skipped" and item["error"].startswith("certainty")
+    assert len(reader.calls) == sum(1 for i in summary["items"] if i["status"] == "second_read")
+    assert summary["items"]

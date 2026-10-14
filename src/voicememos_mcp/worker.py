@@ -445,7 +445,8 @@ class Worker:
                                        "at": now_iso()}
             return {**item, "status": "failed", "error": str(exc)[:300]}
 
-    def second_read_memo(self, memo: Memo, model: str | None = None, redo: bool = False) -> dict:
+    def second_read_memo(self, memo: Memo, model: str | None = None, redo: bool = False,
+                         only_uncertain: bool = False) -> dict:
         """Add a second reader to an existing transcript without calling the primary engine again."""
         item = {"id": memo.id, "short_id": memo.short_id, "title": memo.title, "recorded": memo.recorded}
         entry = self.state.get(memo.id, {})
@@ -458,6 +459,10 @@ class Worker:
             return {**item, "status": "failed", "error": "transcript file missing"}
         if not redo and any(r.get("role") == "second" and not r.get("error") for r in data.get("readers", [])):
             return {**item, "status": "already_read", "markdown": entry.get("markdown")}
+        if only_uncertain and not self.is_long(memo, data.get("words", [])):
+            certainty = notation.stats(data.get("words", []), self.cfg.threshold)["certainty"]
+            if certainty != "low":
+                return {**item, "status": "skipped", "error": f"certainty {certainty}"}
         if not memo.local or not memo.filename:
             return {**item, "status": "not_downloaded"}
         try:
@@ -466,9 +471,12 @@ class Worker:
                 return {**item, "status": "failed", "error": "no second reader configured"}
             with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
                 audio = prepare_audio(self.cfg.recordings_dir / memo.filename, Path(tmp))
-                words, record = self._apply_second_reader(reader, audio, memo, data.get("words", []))
+                words, record = self._apply_second_reader(reader, audio, memo, data.get("words", []),
+                                                          only_uncertain)
         except Exception as exc:  # noqa: BLE001
             return {**item, "status": "failed", "error": str(exc)[:300]}
+        if str(record.get("error", "")).startswith("skipped"):
+            return {**item, "status": "skipped", "error": record["error"]}
         if record.get("error"):
             return {**item, "status": "failed", "error": record["error"]}
         readers = [r for r in data.get("readers", []) if r.get("role") != "second"] + [record]
@@ -575,7 +583,8 @@ class Worker:
                 if action == "identify":
                     item = self.identify_memo(memo)
                 elif second:
-                    item = self.second_read_memo(memo, request.get("model"), bool(request.get("redo")))
+                    item = self.second_read_memo(memo, request.get("model"), bool(request.get("redo")),
+                                                 bool(request.get("only_uncertain")))
                 else:
                     item = self.transcribe_memo(memo, force=bool(request.get("redo")), push_roam=push)
                 job["items"].append({k: item.get(k) for k in ("short_id", "title", "recorded", "status",
@@ -620,7 +629,8 @@ class Worker:
 
     # ------------------------------------------------------------------ second reader batch
     def run_second_read(self, only: list[str] | None = None, since: str | None = None, until: str | None = None,
-                        limit: int | None = None, model: str | None = None, redo: bool = False) -> dict:
+                        limit: int | None = None, model: str | None = None, redo: bool = False,
+                        only_uncertain: bool = False) -> dict:
         """Add the second reader to existing transcripts (synchronously, under the worker lock)."""
         self.store.ensure_dirs()
         try:
@@ -633,7 +643,7 @@ class Worker:
                 for memo in targets:
                     if limit and sum(1 for i in items if i["status"] == "second_read") >= limit:
                         break
-                    items.append(self.second_read_memo(memo, model, redo))
+                    items.append(self.second_read_memo(memo, model, redo, only_uncertain))
                     self.store.write_state(self.state)
                 self.store.write_library(self._snapshot(memos))
                 return {"ok": True, "items": items}

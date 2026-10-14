@@ -185,6 +185,10 @@ words; the transcript (JSON and Markdown) stays one piece. One request per part 
 answer well below the model's default output limit (65,536 tokens for Gemini 4 Argon) and
 avoids drift in very long generations.
 
+For memos transcribed earlier: `voicememos_second_read(since="2000-01-01", only_uncertain=True)`
+(or `voicememos-mcp second-read --only-uncertain --queue`) reads only memos with low certainty,
+and long recordings only in their parts with low certainty. Memos already read are skipped.
+
 Transcripts start with a short reading guide that asks language models not to present
 marked words as certain, and to propose corrections visibly (`word→suggestion (?)`).
 

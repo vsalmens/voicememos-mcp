@@ -50,11 +50,12 @@ def cmd_second_read(args) -> int:
         from .tools import Tools
 
         since = args.since or ("1970-01-01" if not args.memo else None)
-        print(json.dumps(Tools(cfg).second_read(args.memo, since, args.until, args.model, args.redo, args.limit),
+        print(json.dumps(Tools(cfg).second_read(args.memo, since, args.until, args.model, args.redo, args.limit,
+                                                args.only_uncertain),
                          indent=1))
         return 0
     summary = Worker(cfg).run_second_read(only=args.memo, since=args.since, until=args.until, limit=args.limit,
-                                          model=args.model, redo=args.redo)
+                                          model=args.model, redo=args.redo, only_uncertain=args.only_uncertain)
     for item in summary.get("items", []):
         agreement = (item.get("agreement") or {}).get("agreement")
         extra = f" agreement {agreement:.2f}" if agreement is not None else f" {item.get('error') or ''}"
@@ -202,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, help="at most N memos")
     p.add_argument("--model", help="model id (default VOICEMEMOS_SECOND_READER_MODEL)")
     p.add_argument("--redo", action="store_true", help="read again even if already read")
+    p.add_argument("--only-uncertain", action="store_true",
+                   help="only memos (or parts of long recordings) with low certainty")
     p.add_argument("--queue", action="store_true",
                    help="hand the request to the launchd worker (use when this shell lacks Full Disk Access)")
 

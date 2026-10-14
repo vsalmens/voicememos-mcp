@@ -123,7 +123,8 @@ def build_server(tools: Tools | None = None):
     @server.tool()
     def voicememos_second_read(memos: Optional[list[str]] = None, since: Optional[str] = None,
                                until: Optional[str] = None, model: Optional[str] = None,
-                               redo: bool = False, limit: Optional[int] = None) -> dict:
+                               redo: bool = False, limit: Optional[int] = None,
+                               only_uncertain: bool = False) -> dict:
         """Queue a second, independent reading (Gemini) of already transcribed memos.
 
         Disagreements with the primary engine appear as {a|b} in the transcript. Returns a job_id.
@@ -135,8 +136,10 @@ def build_server(tools: Tools | None = None):
             model: Gemini model id (default from config, e.g. gemini-4-argon).
             redo: read again even if a second reading exists.
             limit: at most this many memos (oldest first).
+            only_uncertain: only memos with low certainty; long recordings (read in parts) only in
+                their parts with low certainty.
         """
-        return call(tools.second_read, memos, since, until, model, redo, limit)
+        return call(tools.second_read, memos, since, until, model, redo, limit, only_uncertain)
 
     @server.tool()
     def voicememos_compare_readers(since: Optional[str] = None, until: Optional[str] = None,

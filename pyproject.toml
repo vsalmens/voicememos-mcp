@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "voicememos-mcp"
-version = "0.6.1"
+version = "0.6.2"
 description = "MCP server for Apple Voice Memos with transcription that marks uncertain words"
 readme = "README.md"
 license = "MIT"
