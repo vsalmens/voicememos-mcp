@@ -209,7 +209,8 @@ class Worker:
                                        "enroll only memos where you speak alone")
                 if data:
                     words[memo.id] = data.get("words", [])
-        result = enroll(name, self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL"), samples, self.embedder(), words)
+            # The readers decode lazily from the temporary files, so embed before they are removed.
+            result = enroll(name, self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL"), samples, self.embedder(), words)
         Voiceprint(self.store.voiceprint_path).save(result)
         return Voiceprint(self.store.voiceprint_path).summary()
 

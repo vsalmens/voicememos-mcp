@@ -113,4 +113,7 @@ def no_real_audio_conversion(monkeypatch):
     """Tests use dummy files; skip ffmpeg/afconvert except in the dedicated audio test."""
     import voicememos_mcp.worker as worker
 
-    monkeypatch.setattr(worker, "prepare_audio", lambda path, workdir: path)
+    import shutil
+
+    # Like the real conversion, the result lives in the temporary work directory.
+    monkeypatch.setattr(worker, "prepare_audio", lambda path, workdir: Path(shutil.copy(path, workdir / path.name)))

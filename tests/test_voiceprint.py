@@ -98,11 +98,19 @@ def test_worker_enrolls_and_identifies_through_the_queue(cfg, library):
     ]
     owner_audio = {"AAAA1111": tone(OWNER, 20, seed=1), "BBBB2222": tone(OWNER + 4, 20, seed=2, noise=0.08)}
 
+    def lazy(path, audio):
+        """Like the real reader: decodes from the file on demand, so the file must still exist."""
+        def read(start_s, duration_s):
+            assert path.exists(), f"{path.name} was removed before it was read"
+            a = int(max(start_s, 0) * SR)
+            return audio[a: a + int(duration_s * SR)]
+        return read
+
     def loader(path):
         for key, audio in owner_audio.items():
             if key in path.name:
-                return audio
-        return np.concatenate([tone(OWNER, 8, seed=5), tone(OTHER, 8, seed=6)])
+                return lazy(path, audio)
+        return lazy(path, np.concatenate([tone(OWNER, 8, seed=5), tone(OTHER, 8, seed=6)]))
 
     worker = lambda tokens=None: Worker(cfg, transcriber=FakeTranscriber(tokens=tokens),  # noqa: E731
                                         embedder=fake_embed, audio_loader=loader)
