@@ -54,6 +54,8 @@ HOP_S = 1.5
 MIN_SEGMENT_S = 1.0
 MAX_WINDOWS_PER_SPEAKER = 12   # about 30 s of speech: constant cost per memo
 MAX_WINDOWS_ENROLL = 40
+CLEAN_TURN_S = 3.0             # known other voices: only turns at least this long (after trimming)
+TURN_TRIM_S = 0.4              # ... with this much cut from both ends
 MARGIN = 0.05                  # owner must beat the next speaker by this much for a firm label
 MAYBE_GAP = 0.08               # maybe threshold = match threshold - this
 DEFAULT_BOUNDS = (0.65, 0.95)         # clamp for the match threshold when a model has no own bounds
@@ -147,20 +149,30 @@ def as_reader(audio):
     return read
 
 
-def speech_spans(words: list[dict], speaker: str | None = None, max_gap_ms: int = 500) -> list[tuple[float, float]]:
-    """Time spans (s) where one speaker talks, built from word timings."""
+def speech_spans(words: list[dict], speaker: str | None = None, max_gap_ms: int = 500,
+                 min_s: float = MIN_SEGMENT_S, trim_s: float = 0.0) -> list[tuple[float, float]]:
+    """Time spans (s) where one speaker talks, built from word timings.
+
+    A word by any other speaker ends the span, so a span never bridges someone else's
+    interjection. ``trim_s`` cuts that much from both ends of every span (turn edges are where
+    diarization most often errs); spans shorter than ``min_s`` after trimming are dropped.
+    """
     spans: list[list[float]] = []
+    open_span = False
     for word in words:
         if speaker is not None and str(word.get("speaker")) != speaker:
+            open_span = False
             continue
         start, end = word.get("start_ms"), word.get("end_ms")
         if start is None or end is None:
             continue
-        if spans and start - spans[-1][1] * 1000 <= max_gap_ms:
+        if open_span and spans and start - spans[-1][1] * 1000 <= max_gap_ms:
             spans[-1][1] = end / 1000
         else:
             spans.append([start / 1000, end / 1000])
-    return [(a, b) for a, b in spans if b - a >= MIN_SEGMENT_S]
+        open_span = True
+    trimmed = [(a + trim_s, b - trim_s) for a, b in spans]
+    return [(a, b) for a, b in trimmed if b - a >= min_s]
 
 
 def window_positions(spans: list[tuple[float, float]], limit: int) -> list[tuple[float, float]]:
@@ -281,8 +293,15 @@ def mean_embedding(embed: Embedder, windows: list):
 
 
 def other_voice(name: str, samples, words: list[dict] | None, speaker: str | None, embed: Embedder) -> dict:
-    """Embedding of a known other person ("not me"), from one speaker of one memo."""
-    spans = speech_spans(words, speaker) if words else []
+    """Embedding of a known other person ("not me"), from one speaker of one memo.
+
+    Only longer uninterrupted turns are used, with their edges trimmed, so that words the
+    diarization gave to the wrong speaker (short replies, turn changes) do not leak the
+    owner's voice into the other person's vector.
+    """
+    spans = speech_spans(words, speaker, min_s=CLEAN_TURN_S, trim_s=TURN_TRIM_S) if words else []
+    if words and len(window_positions(spans, MAX_WINDOWS_ENROLL)) < 3:
+        spans = speech_spans(words, speaker)  # too little long speech: use every turn
     windows = windows_from_spans(samples, spans, MAX_WINDOWS_ENROLL) if spans else []
     if len(windows) < 3 and not speaker:
         windows = energy_windows(samples, MAX_WINDOWS_ENROLL)

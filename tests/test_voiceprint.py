@@ -210,3 +210,14 @@ def test_add_other_voice_validation(cfg, library):
         tools.voiceprint("add_other", memos=["aaaa1111"], name="Sam", speaker="X")
     job = tools.voiceprint("add_other", memos=["aaaa1111"], name="Sam", speaker="s2")
     assert tools.store.read_job(job["job_id"])["request"]["speaker"] == "2"
+
+
+def test_spans_do_not_bridge_other_speakers_and_can_be_trimmed():
+    words = [{"text": "a", "start_ms": 0, "end_ms": 900, "speaker": "1"},
+             {"text": "b", "start_ms": 1000, "end_ms": 1900, "speaker": "1"},
+             {"text": "x", "start_ms": 2000, "end_ms": 2200, "speaker": "2"},
+             {"text": "c", "start_ms": 2300, "end_ms": 3900, "speaker": "1"},
+             {"text": "d", "start_ms": 4000, "end_ms": 7900, "speaker": "1"}]
+    assert voiceprint.speech_spans(words, "1") == [(0.0, 1.9), (2.3, 7.9)]
+    trimmed = voiceprint.speech_spans(words, "1", min_s=3.0, trim_s=0.4)
+    assert [(round(a, 3), round(b, 3)) for a, b in trimmed] == [(2.7, 7.5)]
