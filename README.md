@@ -139,8 +139,19 @@ language** (Soniox's language tags decide whether a memo is Finnish, English or 
 * a random sample of disagreements with time offsets, as a listening checklist. Agreement
   says nothing about who is right; listening does.
 
-The alignment is a word-level sequence diff that ignores case and punctuation. Different
-word splitting (compounds, numbers written as digits or words) shows up as disagreement.
+The alignment is a word-level sequence diff that ignores case and punctuation. In Finnish it
+also treats common spoken and written forms of the same word as equal (`mä`/`minä`,
+`oon`/`olen`, `sit`/`sitten`, `niinku`/`niinkuin`, …): one reader tends to write what was
+said, the other what was meant, and that is not a hearing disagreement. Only whole words
+with one obvious written form are folded, never suffixes (`huomasin`/`huomasi` stays a
+disagreement), and forms that are also English words (`sun`, `sit`) are folded only in
+words tagged Finnish. Reports re-align stored readings with the current rules. Different
+word splitting (compounds, numbers written as digits or words) still shows up as
+disagreement.
+
+With `VOICEMEMOS_SECOND_READER=gemini-low` only memos whose primary transcript has **low**
+certainty (15 % or more of the words marked) get a second reading automatically: the
+noisy car memos, not the clear ones. `gemini` reads every new memo.
 
 Transcripts start with a short reading guide that asks language models not to present
 marked words as certain, and to propose corrections visibly (`word→suggestion (?)`).
@@ -236,7 +247,7 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence |
 | `VOICEMEMOS_DIARIZATION` | `1` | separate speakers in conversations |
 | `VOICEMEMOS_VOICEPRINT_NAME` | | your name, shown when the voiceprint recognises you |
-| `VOICEMEMOS_SECOND_READER` | | `gemini` = second reading for every new memo |
+| `VOICEMEMOS_SECOND_READER` | | `gemini` = second reading for every new memo, `gemini-low` = only for memos with low certainty |
 | `VOICEMEMOS_SECOND_READER_MODEL` | `gemini-4-argon` | |
 | `VOICEMEMOS_ROAM_ENABLED` | `0` | append new transcripts to Roam daily notes |
 
@@ -286,7 +297,8 @@ transcripts without new API calls.
 
 ## Privacy and security
 
-* With the second reader, audio also goes to the Gemini API. Large files uploaded through
+* With the second reader, audio also goes to the Gemini API, including any other voices in
+  the recording. Large files uploaded through
   the Files API are deleted right after the request.
 * Audio goes to Soniox for transcription. The uploaded file and the transcription are
   deleted from Soniox right after the transcript is fetched, also when something fails.

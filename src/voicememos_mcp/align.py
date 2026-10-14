@@ -10,7 +10,9 @@ alternative reading with ``basis: reader_disagreement``:
 * extra words only in the reader    -> ``word["insert_after"] = ["b1 b2"]``     -> ``{∅|b1 b2}``
 
 ``∅`` means "this reader heard nothing here". Comparison ignores case and
-punctuation. The alignment is a plain sequence diff (difflib), which is good
+punctuation, and in Finnish also the difference between spoken and written forms
+of the same word ("mä"/"minä", "oon"/"olen"): one reader often writes what was
+said and the other what was meant, which is not a hearing disagreement. The alignment is a plain sequence diff (difflib), which is good
 enough to find disagreements but not to decide who is right.
 """
 
@@ -24,8 +26,33 @@ STRIP = ".,!?;:…\"'“”‘’«»()[]{}-–—"
 UNSURE = re.compile(r"^\(\?\)$")
 
 
+# Spoken Finnish -> written form. Only whole words with one obvious written form;
+# no suffix rules, because "huomasin"/"huomasi" is a real difference.
+SPOKEN_FI = {
+    "mä": "minä", "mie": "minä", "sä": "sinä", "sie": "sinä", "mun": "minun", "sun": "sinun",
+    "meiän": "meidän", "teiän": "teidän", "oon": "olen", "oot": "olet", "ootte": "olette", "oo": "ole",
+    "tää": "tämä", "toi": "tuo", "noi": "nuo", "nää": "nämä",
+    "sit": "sitten", "sitte": "sitten", "niinku": "niinkuin", "niinkun": "niinkuin", "ninku": "niinkuin",
+    "kans": "kanssa", "vaik": "vaikka", "mut": "mutta", "miks": "miksi", "jotain": "jotakin",
+    "tääl": "täällä", "siel": "siellä", "tarvi": "tarvitse", "tarvii": "tarvitse", "vähä": "vähän",
+    "tiiä": "tiedä", "tiiän": "tiedän", "ollu": "ollut", "tullu": "tullut", "menny": "mennyt",
+    "tehny": "tehnyt", "semmonen": "sellainen", "tämmönen": "tällainen", "tommonen": "tuollainen",
+    "ku": "kun",
+}
+# Spoken forms that are also common English words: folded only in Finnish context.
+AMBIGUOUS_EN = {"sun", "sit", "mut"}
+
+
 def normalise(word: str) -> str:
     return word.casefold().strip(STRIP).replace("’", "'")
+
+
+def comparison_key(word: str, lang: str | None) -> str:
+    """Normalised word, with Finnish spoken forms folded to the written form when the word is Finnish."""
+    key = normalise(word)
+    if key in SPOKEN_FI and (lang == "fi" or (lang is None and key not in AMBIGUOUS_EN)):
+        return SPOKEN_FI[key]
+    return key
 
 
 def reader_words(text: str) -> list[dict]:
@@ -57,8 +84,12 @@ def align(primary: list[dict], reader_text: str, threshold: float = 0.7) -> tupl
     words = [{k: v for k, v in w.items() if k not in ("alts", "span", "in_span", "insert_after", "basis",
                                                       "flag", "reader_unsure")} for w in primary]
     other = reader_words(reader_text)
-    a = [normalise(w["text"]) for w in words]
-    b = [normalise(w["text"]) for w in other]
+    memo_lang = dominant_language(words)
+    reader_lang = "fi" if memo_lang == "fi" else None  # mixed memos: fold only the unambiguous forms
+    a = [comparison_key(w["text"], w.get("lang") or reader_lang) for w in words]
+    b = [comparison_key(w["text"], reader_lang) for w in other]
+    folded = sum(1 for w, k in zip(words, a) if normalise(w["text"]) != k) \
+        + sum(1 for w, k in zip(other, b) if normalise(w["text"]) != k)
     matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
 
     matched = substituted = deleted = inserted = spans = spans_low_conf = 0
@@ -118,5 +149,6 @@ def align(primary: list[dict], reader_text: str, threshold: float = 0.7) -> tupl
         "low_confidence_words_confirmed_by_reader": low_conf_agreed,
         "reader_unsure_marks": sum(1 for w in other if w.get("unsure")),
         "reader_gaps": sum(1 for w in other if w.get("gap")),
+        "spoken_forms_folded": folded,
     }
     return words, metrics

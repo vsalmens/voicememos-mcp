@@ -196,3 +196,35 @@ def test_queued_second_read_respects_limit_and_skips_done(cfg, fake):
     Worker(cfg, transcriber=fake, second_reader=reader).run()
     assert tools.transcribe_status(second["job_id"])["total"] == 1  # the already-read memo is skipped
     assert len(reader.calls) == 2
+
+
+def fi_words(texts, confs=None):
+    return [{**w, "lang": "fi"} for w in primary(texts, confs)]
+
+
+def test_finnish_spoken_forms_are_not_disagreements():
+    words, m = align.align(fi_words(["Mä", "oon", "sit", "tulossa", "niinku", "huomenna."]),
+                           "Minä olen sitten tulossa niinkuin huomenna.")
+    assert m["disagreement_spans"] == 0 and m["agreement"] == 1.0 and m["spoken_forms_folded"] == 4
+    assert render(words) == "Mä oon sit tulossa niinku huomenna."
+
+
+def test_finnish_folding_keeps_real_differences():
+    _, m = align.align(fi_words(["mä", "huomasin", "sen."]), "minä huomasi sen.")
+    assert m["disagreement_spans"] == 1 and m["substituted"] == 1
+
+
+def test_english_sun_is_not_folded():
+    _, m = align.align(primary(["the", "sun", "is", "up."]), "the sinun is up.")
+    assert m["disagreement_spans"] == 1
+
+
+def test_gemini_low_reads_only_uncertain_memos(cfg, fake):
+    cfg.raw["VOICEMEMOS_SECOND_READER"] = "gemini-low"
+    reader = fake_reader()
+    worker = Worker(cfg, transcriber=fake, second_reader=reader)
+    sure = primary(["all", "clear", "here."])
+    unsure = primary(["mumble", "mumble", "maybe."], [0.3, 0.4, 0.99])
+    assert not worker.wants_second_read(sure) and worker.wants_second_read(unsure)
+    cfg.raw["VOICEMEMOS_SECOND_READER"] = "gemini"
+    assert worker.wants_second_read(sure)

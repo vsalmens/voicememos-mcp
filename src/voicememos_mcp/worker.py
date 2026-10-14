@@ -128,16 +128,23 @@ class Worker:
         return self._transcriber
 
     def second_reader(self, model: str | None = None, on_demand: bool = False) -> SecondReader | None:
-        """The reader used after each new transcription (``VOICEMEMOS_SECOND_READER=gemini``), or,
-        with ``on_demand``, for explicit second-read requests even when automatic reading is off."""
+        """The reader used after new transcriptions (``VOICEMEMOS_SECOND_READER=gemini`` or
+        ``gemini-low``), or, with ``on_demand``, for explicit second-read requests even when automatic
+        reading is off."""
         if self._second_reader is not None and model is None:
             return self._second_reader
-        if model or on_demand or self.cfg.get("VOICEMEMOS_SECOND_READER") == "gemini":
+        if model or on_demand or self.cfg.get("VOICEMEMOS_SECOND_READER") in ("gemini", "gemini-low"):
             reader = gemini_reader(self.cfg, model)
             if model is None:
                 self._second_reader = reader
             return reader
         return None
+
+    def wants_second_read(self, words: list[dict]) -> bool:
+        """``gemini-low`` reads only memos whose primary transcript has low certainty."""
+        if self.cfg.get("VOICEMEMOS_SECOND_READER") != "gemini-low":
+            return True
+        return notation.stats(words, self.cfg.threshold)["certainty"] == "low"
 
     def _apply_second_reader(self, reader: SecondReader, audio: Path, memo: Memo, words: list[dict]) -> tuple[list[dict], dict]:
         """Run the second reader and align it. Returns (words, reader_record). Never raises."""
@@ -361,7 +368,7 @@ class Worker:
                 tokens = self.transcriber(audio)
                 words, had_confidence = notation.tokens_to_words(tokens)
                 reader = None if dry_run else self.second_reader()
-                if reader is not None:
+                if reader is not None and self.wants_second_read(words):
                     words, second_record = self._apply_second_reader(reader, audio, memo, words)
                 speakers = notation.speaker_labels(words)
                 voice = None
