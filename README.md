@@ -189,12 +189,13 @@ For memos transcribed earlier: `voicememos_second_read(since="2000-01-01", only_
 (or `voicememos-mcp second-read --only-uncertain --queue`) reads only memos with low certainty,
 and long recordings only in their parts with low certainty. Memos already read are skipped.
 
-A reading that agrees with the primary words on less than a quarter of the words
-(`VOICEMEMOS_SECOND_READER_MIN_AGREEMENT`, default 0.25) is rejected: the model has written
-something other than the recording (seen once: a made-up exercise plan for a short, quiet
-memo). Nothing is marked, earlier marks from that reader are removed, and its text is kept
-in the JSON with the reason. Genuinely hard recordings stay well above that floor (noisy car
-memos: 0.35–0.6). For long recordings the check is done per part.
+A reading that agrees with the primary words on less than a tenth of the words
+(`VOICEMEMOS_SECOND_READER_MIN_AGREEMENT`, default 0.1) is rejected: the model has written
+something other than the recording (seen once: a made-up exercise plan, agreement 0.04, for
+a quiet meditation memo). Nothing is marked, earlier marks from that reader are removed, and
+its text is kept in the JSON with the reason. The floor is low on purpose: on very hard
+recordings (loud music, a disguised voice) genuine readings agreed only 0.17–0.19 and were
+sometimes better than the primary engine. For long recordings the check is done per part.
 
 Transcripts start with a short reading guide that asks language models not to present
 marked words as certain, and to propose corrections visibly (`word→suggestion (?)`).
