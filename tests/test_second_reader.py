@@ -181,6 +181,9 @@ def test_queue_second_read_and_report(cfg, fake):
     assert en["samples"][0]["primary"] == "bird" and en["samples"][0]["reader"] == "bed"
     text = render_report(report)
     assert "| English |" in text and "A (primary): bird" in text
+    order = [(x["recorded"], x["memo_id"], x["start_ms"]) for x in en["samples"]]
+    assert order == sorted(order)
+    assert sum(1 for line in text.splitlines() if line.startswith("### ")) == len({x["memo_id"] for x in en["samples"]})
     result = tools.compare_readers()
     assert result["report_file"].endswith(".md") and "samples" not in result["languages"]["en"]
 

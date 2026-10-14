@@ -116,7 +116,9 @@ def build_report(store: Store, since: str | None = None, until: str | None = Non
                                                        / primary_words, 1) if primary_words else None,
             "reader_tokens": tokens,
             "models": sorted({i["second"].get("model") or "?" for i in items}),
-            "samples": rng.sample(pool, min(samples, len(pool))),
+            # listening order: one recording at a time, front to back
+            "samples": sorted(rng.sample(pool, min(samples, len(pool))),
+                              key=lambda d: (d["recorded"], d["memo_id"] or "", d["start_ms"] or 0)),
         }
     return {"created": now_iso(), "since": since, "until": until, "languages": languages}
 
@@ -127,7 +129,8 @@ def render_report(report: dict) -> str:
              + (f" Memos from {report['since']}" if report.get("since") else "")
              + (f" to {report['until']}" if report.get("until") else ""), "",
              "Agreement shows how often the engines heard the same words, not who is right. "
-             "Listen to the samples (time = offset in the memo) and tick the better reading.", ""]
+             "Samples are grouped by recording and in time order, so each recording is opened once. "
+             "Listen (time = offset in the memo) and tick the better reading.", ""]
     if not report["languages"]:
         return "\n".join(lines + ["No memos with a second reader yet."]) + "\n"
     rows = [("Memos", "memos"), ("Primary words", "primary_words"), ("Reader words", "reader_words"),
@@ -147,9 +150,13 @@ def render_report(report: dict) -> str:
     for lang in langs:
         group = report["languages"][lang]
         lines += [f"## Samples: {LANGUAGE_LABELS.get(lang, lang)} ({', '.join(group['models'])})", ""]
+        current = None
         for s in group["samples"]:
+            if s["memo_id"] != current:
+                current = s["memo_id"]
+                lines += ["", f"### {s.get('title') or '(untitled)'}, {s['recorded'].replace('T', ' ')} `{current}`", ""]
             conf = f", primary confidence {s['primary_conf']}" if s.get("primary_conf") is not None else ""
-            lines += [f"- [ ] **{s['recorded']}** {s.get('title') or ''} `{s['memo_id']}` at {_fmt_time(s['start_ms'])}{conf}",
+            lines += [f"- [ ] at {_fmt_time(s['start_ms'])}{conf}",
                       f"  - A (primary): {s['primary']}",
                       f"  - B (reader): {s['reader']}",
                       f"  - context: {s['context']}",
