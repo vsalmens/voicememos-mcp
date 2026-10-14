@@ -5,7 +5,8 @@ the transcription and the uploaded file. Deletion runs on every exit path so no
 audio or transcript is left on Soniox's servers.
 
 Each returned token carries ``text``, ``start_ms``, ``end_ms``, ``confidence``
-(0..1) and, with language identification enabled, ``language``.
+(0..1), ``language`` (language identification) and, with diarization enabled,
+``speaker`` (a label that is only meaningful within one recording).
 """
 
 from __future__ import annotations
@@ -61,7 +62,8 @@ class Soniox:
         raise SonioxError(f"Soniox: giving up on {method} {path}")
 
     def transcribe(self, audio: Path, language_hints: list[str], context_terms: list[str] | None = None,
-                   context_text: str = "", reference: str = "voicememos-mcp") -> list[dict]:
+                   context_text: str = "", reference: str = "voicememos-mcp",
+                   diarization: bool = False) -> list[dict]:
         with open(audio, "rb") as fh:
             file_id = self._request("POST", "/v1/files", files={"file": (audio.name, fh)}, timeout=600).json()["id"]
         transcription_id = None
@@ -73,6 +75,8 @@ class Soniox:
                 "enable_language_identification": True,
                 "client_reference_id": reference,
             }
+            if diarization:
+                body["enable_speaker_diarization"] = True
             context: dict = {}
             if context_terms:
                 context["terms"] = context_terms

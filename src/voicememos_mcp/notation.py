@@ -79,6 +79,7 @@ def tokens_to_words(tokens: list[dict]) -> tuple[list[dict], bool]:
                 "end_ms": token.get("end_ms"),
                 "conf": None if (conf is None or punctuation) else float(conf),
                 "lang": token.get("language"),
+                "speaker": token.get("speaker"),
             })
         else:
             word = words[-1]
@@ -157,16 +158,70 @@ def _with_inserts(word: dict, rendered: str) -> str:
     return " ".join(x for x in (before, rendered, after) if x)
 
 
-def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_ms: int = 2500) -> list[str]:
-    """Render words to paragraphs. A pause longer than ``pause_ms`` starts a new paragraph."""
+def speaker_labels(words: list[dict], owner_name: str = "", owner_min_share: float = 0.6) -> dict:
+    """Label speakers when more than one was detected; ``{}`` for single-speaker memos.
+
+    Speakers are numbered S1, S2, ... in order of appearance. With ``owner_name`` set, the
+    speaker who says at least ``owner_min_share`` of the words is shown as ``"<owner> (?)"``:
+    a guess from speaking share, marked like any other uncertain reading.
+    """
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for word in words:
+        spk = word.get("speaker")
+        if spk in (None, ""):
+            continue
+        spk = str(spk)
+        if spk not in counts:
+            order.append(spk)
+            counts[spk] = 0
+        counts[spk] += 1
+    if len(order) < 2:
+        return {}
+    total = sum(counts.values())
+    labels = {}
+    top = max(order, key=lambda k: counts[k])
+    for number, spk in enumerate(order, start=1):
+        share = counts[spk] / total
+        if owner_name and spk == top and share >= owner_min_share:
+            labels[spk] = {"label": f"{owner_name} (?)", "words": counts[spk], "share": round(share, 3),
+                           "basis": "speaking_share"}
+        else:
+            labels[spk] = {"label": f"S{number}", "words": counts[spk], "share": round(share, 3)}
+    return labels
+
+
+def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_ms: int = 2500,
+                  speakers: dict | None = None) -> list[str]:
+    """Render words to paragraphs.
+
+    A pause longer than ``pause_ms`` starts a new paragraph. With ``speakers`` (from
+    ``speaker_labels``), a change of speaker also starts one, prefixed with ``**label:**``.
+    """
+    speakers = speakers or {}
     blocks: list[list[str]] = [[]]
+    prefixes: list[str] = [""]
+    current = None
+
+    def speaker_of(word: dict):
+        spk = word.get("speaker")
+        return str(spk) if spk not in (None, "") and str(spk) in speakers else None
+
     i, n = 0, len(words)
     while i < n:
         word = words[i]
-        if i > 0 and blocks[-1]:
+        spk = speaker_of(word)
+        if spk is not None and spk != current:
+            if blocks[-1]:
+                blocks.append([])
+                prefixes.append("")
+            prefixes[-1] = f"**{speakers[spk]['label']}:** "
+            current = spk
+        elif i > 0 and blocks[-1]:
             prev_end, start = words[i - 1].get("end_ms"), word.get("start_ms")
             if prev_end is not None and start is not None and start - prev_end > pause_ms:
                 blocks.append([])
+                prefixes.append("")
         if word.get("span"):
             span = word["span"]
             group = words[i: i + max(span.get("n", 1), 1)]
@@ -180,7 +235,8 @@ def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_m
         if _is_uncertain(word, threshold) and not word.get("insert_after") and not word.get("insert_before"):
             j = i
             while (j < n and _is_uncertain(words[j], threshold)
-                   and not words[j].get("insert_after") and not words[j].get("insert_before")):
+                   and not words[j].get("insert_after") and not words[j].get("insert_before")
+                   and (j == i or speaker_of(words[j]) in (None, spk))):
                 j += 1
             run = words[i:j]
             if len(run) >= run_min:
@@ -193,7 +249,7 @@ def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_m
             continue
         blocks[-1].append(_with_inserts(word, render_word(word, threshold)))
         i += 1
-    return [" ".join(b) for b in blocks if b]
+    return [prefix + " ".join(b) for prefix, b in zip(prefixes, blocks) if b]
 
 
 def stats(words: list[dict], threshold: float) -> dict:

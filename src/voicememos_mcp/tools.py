@@ -50,6 +50,7 @@ def _summary(memo: dict) -> dict:
         "certainty": stats.get("certainty"),
         "marked_share": stats.get("marked_share"),
         "markers": len(transcript.get("markers") or []),
+        "speakers": transcript.get("speakers") or None,
     }
 
 
@@ -165,7 +166,7 @@ class Tools:
             return {**info, "data": body}
         if format == "text":
             text = "\n\n".join(notation.render_blocks(data.get("words", []), thr, self.cfg.run_min,
-                                                      self.cfg.pause_ms))
+                                                      self.cfg.pause_ms, data.get("speakers")))
         elif format == "markdown":
             text = render_markdown(data, thr, self.cfg.run_min, self.cfg.pause_ms)
         else:

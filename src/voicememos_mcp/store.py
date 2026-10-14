@@ -127,7 +127,8 @@ class Store:
         """
         base = self.transcript_base(memo)
         base.parent.mkdir(parents=True, exist_ok=True)
-        text = "\n\n".join(notation.render_blocks(words, threshold, run_min, pause_ms))
+        speakers = (extra or {}).get("speakers")
+        text = "\n\n".join(notation.render_blocks(words, threshold, run_min, pause_ms, speakers))
         data = {
             "schema": SCHEMA,
             "memo": {k: memo.get(k) for k in ("id", "title", "recorded", "duration_s", "filename", "folder")},
@@ -164,7 +165,7 @@ class Store:
         if self.output_dir.resolve() not in json_path.parents:
             raise ValueError("transcript path outside the output directory")
         words = data.get("words", [])
-        text = "\n\n".join(notation.render_blocks(words, threshold, run_min, pause_ms))
+        text = "\n\n".join(notation.render_blocks(words, threshold, run_min, pause_ms, data.get("speakers")))
         data["stats"] = notation.stats(words, threshold)
         data["markers"] = notation.extract_markers(text, markers)
         data["words"] = notation.annotate(words, threshold)
@@ -219,7 +220,7 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
     memo = data["memo"]
     words = data.get("words", [])
     s = notation.stats(words, threshold)
-    blocks = notation.render_blocks(words, threshold, run_min, pause_ms)
+    blocks = notation.render_blocks(words, threshold, run_min, pause_ms, data.get("speakers"))
     text = "\n\n".join(blocks)
     markers = data.get("markers", [])
     title = memo.get("title") or "Voice memo"
@@ -253,6 +254,12 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
         front += [f"> Second reader: {second.get('model')}, word agreement "
                   f"{100 * agreement:.0f} %. `{{a|b}}` shows where the engines differ." if agreement is not None
                   else f"> Second reader: {second.get('model')}.", ""]
+    speakers = data.get("speakers") or {}
+    if speakers:
+        parts = ", ".join(f"{v['label']} {100 * v['share']:.0f} %" for v in speakers.values())
+        owner_note = (" A name followed by (?) is a guess from speaking share, not voice recognition."
+                      if any(v.get("basis") == "speaking_share" for v in speakers.values()) else "")
+        front += [f"> Speakers (share of words): {parts}.{owner_note}", ""]
     if not data.get("confidence_available"):
         front += ["> Warning: the engine returned no confidence values, so nothing is marked as uncertain.", ""]
     if markers:

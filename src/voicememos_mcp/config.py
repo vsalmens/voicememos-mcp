@@ -50,6 +50,9 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_LAUNCHD_LABEL": "local.voicememos-mcp.sync",
     "SONIOX_BASE_URL": "https://api.soniox.com",
     "SONIOX_MODEL": "stt-async-v5",
+    "VOICEMEMOS_DIARIZATION": "1",
+    "VOICEMEMOS_OWNER_NAME": "",
+    "VOICEMEMOS_OWNER_MIN_SHARE": "0.6",
     "VOICEMEMOS_SECOND_READER": "",
     "VOICEMEMOS_SECOND_READER_MODEL": "gemini-4-argon",
     "VOICEMEMOS_SECOND_READER_MAX_MIN": "60",
@@ -164,6 +167,14 @@ class Config:
     @property
     def pause_ms(self) -> int:
         return int(self.get("VOICEMEMOS_PAUSE_MS"))
+
+    @property
+    def owner_name(self) -> str:
+        return self.get("VOICEMEMOS_OWNER_NAME").strip()
+
+    @property
+    def owner_min_share(self) -> float:
+        return float(self.get("VOICEMEMOS_OWNER_MIN_SHARE"))
 
     @property
     def markers(self) -> dict[str, str]:

@@ -58,6 +58,22 @@ exported to TEI (`<unclear cert>`, `<choice>`) or ALTO (`WC`, `ALTERNATIVE`). No
 standard keeps everything a speech engine returns (sub-word tokens, per-token language,
 timings), which is why the raw response is stored as well.
 
+## Speakers
+
+With `VOICEMEMOS_DIARIZATION=1` (default), Soniox separates speakers. Single-speaker memos
+look the same as before; conversations get one paragraph per turn:
+
+```
+**Alex (?):** How did it go?
+**S2:** Fine (?), thanks.
+```
+
+Speakers are numbered in order of appearance; the labels only hold within one memo. With
+`VOICEMEMOS_OWNER_NAME` set, the speaker who says most of the words (at least
+`VOICEMEMOS_OWNER_MIN_SHARE`) is shown under that name with `(?)`: it is a guess from speaking
+share, not voice recognition, and is marked like any other uncertain reading. The JSON keeps
+per-speaker word counts and shares (`speakers`) and the speaker of every word.
+
 ## Second reader
 
 Gemini models return text without word confidence, so they cannot drive the `(?)` marks.
@@ -151,6 +167,8 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
 | `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence |
+| `VOICEMEMOS_DIARIZATION` | `1` | separate speakers in conversations |
+| `VOICEMEMOS_OWNER_NAME` | | label the dominant speaker as "Name (?)" |
 | `VOICEMEMOS_SECOND_READER` | | `gemini` = second reading for every new memo |
 | `VOICEMEMOS_SECOND_READER_MODEL` | `gemini-4-argon` | |
 | `VOICEMEMOS_ROAM_ENABLED` | `0` | append new transcripts to Roam daily notes |
@@ -224,6 +242,8 @@ transcripts without new API calls.
 ## Roadmap
 
 * Adjudication: a third pass that listens to the disputed segment and picks a reading.
+* Owner identification by voice (speaker embedding against reference recordings) instead of
+  speaking share.
 * Export to TEI (spoken text) and WebVTT.
 
 ## Development

@@ -59,7 +59,8 @@ def soniox_transcriber(cfg: Config) -> Transcriber:
     client = Soniox(key, cfg.get("SONIOX_BASE_URL"), cfg.get("SONIOX_MODEL"))
 
     def transcribe(audio: Path) -> list[dict]:
-        return client.transcribe(audio, cfg.languages, cfg.context_terms, cfg.context_text)
+        return client.transcribe(audio, cfg.languages, cfg.context_terms, cfg.context_text,
+                                 diarization=cfg.flag("VOICEMEMOS_DIARIZATION"))
 
     return transcribe
 
@@ -172,7 +173,7 @@ class Worker:
             item["status"] = self._status(memo)
             if entry.get("ok"):
                 item["transcript"] = {k: entry.get(k) for k in ("json", "markdown", "stats", "markers", "at",
-                                                                "language", "second_reader")}
+                                                                "language", "second_reader", "speakers")}
             elif entry.get("error"):
                 item["error"] = entry["error"]
             items.append(item)
@@ -206,14 +207,15 @@ class Worker:
                 reader = None if dry_run else self.second_reader()
                 if reader is not None:
                     words, second_record = self._apply_second_reader(reader, audio, memo, words)
+            speakers = notation.speaker_labels(words, self.cfg.owner_name, self.cfg.owner_min_share)
             if dry_run:
                 text = "\n\n".join(notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min,
-                                                          self.cfg.pause_ms))
+                                                          self.cfg.pause_ms, speakers))
                 return {**item, "status": "dry_run", "stats": notation.stats(words, self.cfg.threshold),
                         "text": text, "confidence_available": had_confidence}
             engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
                       "language_hints": self.cfg.languages}
-            extra = {"language": align.dominant_language(words),
+            extra = {"language": align.dominant_language(words), "speakers": speakers,
                      "readers": [{"role": "primary", **engine, "created": now_iso()}]
                      + ([second_record] if second_record else [])}
             result = self.store.write_transcript(
@@ -221,6 +223,7 @@ class Worker:
                 self.cfg.run_min, self.cfg.pause_ms, self.cfg.markers, source_tokens=tokens, extra=extra,
             )
             result["language"] = extra["language"]
+            result["speakers"] = len(speakers)
             if second_record and not second_record.get("error"):
                 result["second_reader"] = {"model": second_record.get("model"),
                                            "agreement": second_record["agreement"]["agreement"]}
@@ -274,7 +277,8 @@ class Worker:
         data.setdefault("language", align.dominant_language(words))
         result = self.store.rewrite_transcript(entry["json"], data, self.cfg.threshold, self.cfg.run_min,
                                                self.cfg.pause_ms, self.cfg.markers)
-        entry.update(stats=result["stats"], markers=result["markers"], language=data["language"])
+        entry.update(stats=result["stats"], markers=result["markers"], language=data["language"],
+                     speakers=len(data.get("speakers") or {}))
         entry["second_reader"] = {"model": record.get("model"), "agreement": record["agreement"]["agreement"],
                                   "at": record["created"]}
         self.state[memo.id] = entry
@@ -286,7 +290,9 @@ class Worker:
             item["roam_error"] = "ROAM_GRAPH or ROAM_API_TOKEN missing"
             return
         try:
-            blocks = notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min, self.cfg.pause_ms)
+            blocks = notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min, self.cfg.pause_ms,
+                                            notation.speaker_labels(words, self.cfg.owner_name,
+                                                                    self.cfg.owner_min_share))
             parent = roam.heading(self.cfg.get("VOICEMEMOS_ROAM_HEADING"), memo.to_dict(),
                                   notation.stats_line(result["stats"]))
             roam.append_daily_note(graph, token, dt.date.fromisoformat(memo.recorded[:10]), parent,
