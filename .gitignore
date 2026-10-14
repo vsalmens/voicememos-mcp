@@ -1,0 +1,22 @@
+# Private configuration never belongs in the repository
+config.env
+*.local.env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Audio and transcripts (personal data)
+*.m4a
+*.qta
+*.caf
+transcripts/

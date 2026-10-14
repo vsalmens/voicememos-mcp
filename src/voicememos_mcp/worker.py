@@ -1,0 +1,320 @@
+"""The worker: the only component that reads the Voice Memos container.
+
+One run (``voicememos-mcp sync``):
+
+1. read the library database and write a snapshot to ``library.json``,
+2. process queued transcription requests from the MCP server,
+3. transcribe new memos automatically (if enabled),
+4. optionally append new transcripts to Roam,
+5. record the result in ``worker.json``.
+
+On macOS it runs from launchd, triggered by changes in the recordings folder or
+the queue folder and every 30 minutes. Only this process needs Full Disk Access.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime as dt
+import fcntl
+import logging
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable
+
+from . import notation, roam
+from .audio import prepare_audio
+from .config import Config
+from .library import LibraryError, Memo, is_excluded, read_library
+from .store import Store, now_iso
+
+log = logging.getLogger(__name__)
+
+Transcriber = Callable[[Path], list[dict]]
+
+
+class Busy(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def single_instance(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Busy("another worker run is in progress") from exc
+        yield
+
+
+def soniox_transcriber(cfg: Config) -> Transcriber:
+    from .soniox import Soniox
+
+    key = cfg.secret("SONIOX_API_KEY")
+    if not key:
+        raise RuntimeError("SONIOX_API_KEY is not set (environment or Keychain)")
+    client = Soniox(key, cfg.get("SONIOX_BASE_URL"), cfg.get("SONIOX_MODEL"))
+
+    def transcribe(audio: Path) -> list[dict]:
+        return client.transcribe(audio, cfg.languages, cfg.context_terms, cfg.context_text)
+
+    return transcribe
+
+
+def _fingerprint(path: Path) -> str:
+    st = path.stat()
+    return f"{st.st_size}:{int(st.st_mtime)}"
+
+
+def _in_range(memo: Memo, since: str | None, until: str | None) -> bool:
+    day = (memo.recorded or "")[:10]
+    if since and (not day or day < since):
+        return False
+    if until and (not day or day > until):
+        return False
+    return True
+
+
+class Worker:
+    def __init__(self, cfg: Config, store: Store | None = None, transcriber: Transcriber | None = None,
+                 roam_session=None, clock: Callable[[], float] = time.time):
+        self.cfg = cfg
+        self.store = store or Store(cfg.data_dir, cfg.output_dir)
+        self._transcriber = transcriber
+        self.roam_session = roam_session
+        self.clock = clock
+        self.state: dict = {}
+
+    # ------------------------------------------------------------------ helpers
+    @property
+    def transcriber(self) -> Transcriber:
+        if self._transcriber is None:
+            self._transcriber = soniox_transcriber(self.cfg)
+        return self._transcriber
+
+    def _excluded(self, memo: Memo) -> bool:
+        return is_excluded(memo, self.cfg.exclude_title_regex, self.cfg.exclude_folders)
+
+    def _status(self, memo: Memo) -> str:
+        entry = self.state.get(memo.id, {})
+        if memo.deleted:
+            return "deleted"
+        if entry.get("ok"):
+            return "transcribed"
+        if not memo.local:
+            return "not_downloaded"
+        if entry.get("attempts", 0) >= self.cfg.max_attempts:
+            return "failed"
+        if memo.duration_s and memo.duration_s > self.cfg.max_duration_s:
+            return "too_long"
+        if self.cfg.since and not _in_range(memo, self.cfg.since, None):
+            return "not_transcribed"
+        return "pending" if self.cfg.flag("VOICEMEMOS_AUTO_TRANSCRIBE") else "not_transcribed"
+
+    def _snapshot(self, memos: list[Memo]) -> dict:
+        items, excluded = [], 0
+        for memo in memos:
+            if self._excluded(memo):
+                excluded += 1  # excluded memos are not listed at all, not even their titles
+                continue
+            entry = self.state.get(memo.id, {})
+            item = memo.to_dict()
+            item["status"] = self._status(memo)
+            if entry.get("ok"):
+                item["transcript"] = {k: entry.get(k) for k in ("json", "markdown", "stats", "markers", "at")}
+            elif entry.get("error"):
+                item["error"] = entry["error"]
+            items.append(item)
+        return {"updated": now_iso(), "recordings_dir": str(self.cfg.recordings_dir),
+                "excluded_count": excluded, "memos": items}
+
+    # ------------------------------------------------------------------ one memo
+    def transcribe_memo(self, memo: Memo, force: bool = False, push_roam: bool = False,
+                        dry_run: bool = False) -> dict:
+        """Transcribe one memo. Returns an item dict with ``status`` and, on success, output paths."""
+        item = {"id": memo.id, "short_id": memo.short_id, "title": memo.title, "recorded": memo.recorded}
+        if self._excluded(memo):
+            return {**item, "status": "excluded", "title": None}
+        if memo.deleted:
+            return {**item, "status": "deleted"}
+        if not memo.local or not memo.filename:
+            return {**item, "status": "not_downloaded",
+                    "error": "audio is still in iCloud; play the memo once in Voice Memos on this Mac"}
+        path = self.cfg.recordings_dir / memo.filename
+        fingerprint = _fingerprint(path)
+        entry = self.state.get(memo.id, {})
+        if not force and entry.get("ok") and entry.get("fp") == fingerprint:
+            return {**item, "status": "already_transcribed", "markdown": entry.get("markdown")}
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+                tokens = self.transcriber(prepare_audio(path, Path(tmp)))
+            words, had_confidence = notation.tokens_to_words(tokens)
+            if dry_run:
+                text = "\n\n".join(notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min,
+                                                          self.cfg.pause_ms))
+                return {**item, "status": "dry_run", "stats": notation.stats(words, self.cfg.threshold),
+                        "text": text, "confidence_available": had_confidence}
+            engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
+                      "language_hints": self.cfg.languages}
+            result = self.store.write_transcript(
+                memo.to_dict(), words, engine, had_confidence, self.cfg.threshold,
+                self.cfg.run_min, self.cfg.pause_ms, self.cfg.markers, source_tokens=tokens,
+            )
+            new_entry = {"fp": fingerprint, "ok": True, "at": now_iso(), **result}
+            if entry.get("roam"):
+                new_entry["roam"] = entry["roam"]
+            self.state[memo.id] = new_entry
+            item.update(status="transcribed", markdown=result["markdown"], stats=result["stats"])
+            if push_roam and self.cfg.flag("VOICEMEMOS_ROAM_ENABLED") and not new_entry.get("roam"):
+                self._push_roam(memo, words, result, new_entry, item)
+            return item
+        except Exception as exc:  # noqa: BLE001 - one failing memo must not stop the run
+            log.exception("Transcription failed for %s", memo.id)
+            if not dry_run:
+                self.state[memo.id] = {**entry, "ok": False, "fp": fingerprint,
+                                       "attempts": entry.get("attempts", 0) + 1, "error": str(exc)[:300],
+                                       "at": now_iso()}
+            return {**item, "status": "failed", "error": str(exc)[:300]}
+
+    def _push_roam(self, memo: Memo, words: list[dict], result: dict, entry: dict, item: dict) -> None:
+        graph, token = self.cfg.get("ROAM_GRAPH"), self.cfg.secret("ROAM_API_TOKEN")
+        if not (graph and token and memo.recorded):
+            item["roam_error"] = "ROAM_GRAPH or ROAM_API_TOKEN missing"
+            return
+        try:
+            blocks = notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min, self.cfg.pause_ms)
+            parent = roam.heading(self.cfg.get("VOICEMEMOS_ROAM_HEADING"), memo.to_dict(),
+                                  notation.stats_line(result["stats"]))
+            roam.append_daily_note(graph, token, dt.date.fromisoformat(memo.recorded[:10]), parent,
+                                   blocks or ["(no speech recognised)"], session=self.roam_session)
+            entry["roam"] = now_iso()
+            item["roam"] = True
+        except Exception as exc:  # noqa: BLE001 - the transcript is already saved
+            entry["roam_error"] = str(exc)[:300]
+            item["roam_error"] = str(exc)[:300]
+
+    # ------------------------------------------------------------------ queue
+    def _resolve_request(self, request: dict, memos: list[Memo]) -> list[Memo]:
+        wanted = [str(x).lower().replace("-", "") for x in request.get("memos") or []]
+        since, until = request.get("since"), request.get("until")
+        selected = []
+        for memo in memos:
+            if self._excluded(memo) or memo.deleted:
+                continue
+            if wanted:
+                keys = {memo.id.lower().replace("-", ""), (Path(memo.filename).stem.lower() if memo.filename else "")}
+                if not any(w and any(k.startswith(w) for k in keys if k) for w in wanted):
+                    continue
+            elif not (since or until or request.get("all")):
+                continue
+            if not _in_range(memo, since, until):
+                continue
+            selected.append(memo)
+        selected.sort(key=lambda m: m.recorded or "")
+        return selected
+
+    def process_queue(self, memos: list[Memo]) -> list[dict]:
+        jobs = []
+        for request_doc in self.store.pending_requests():
+            job = self.store.read_job(request_doc["job_id"]) or request_doc
+            request = job.get("request", {})
+            targets = self._resolve_request(request, memos)
+            job.update(status="running", started=now_iso(), total=len(targets), done=0, failed=0, items=[])
+            self.store.write_job(job)
+            push = bool(request.get("push_roam")) or self.cfg.flag("VOICEMEMOS_ROAM_BACKFILL")
+            for memo in targets:
+                item = self.transcribe_memo(memo, force=bool(request.get("redo")), push_roam=push)
+                job["items"].append({k: item.get(k) for k in ("short_id", "title", "recorded", "status",
+                                                             "error", "markdown")})
+                job["done"] += 1
+                job["failed"] += item["status"] == "failed"
+                self.store.write_job(job)
+                self.store.write_state(self.state)
+            job.update(status="done", finished=now_iso())
+            if not targets:
+                job["note"] = "no memos matched the request"
+            self.store.write_job(job)
+            self.store.finish_request(job["job_id"])
+            jobs.append(job)
+        return jobs
+
+    # ------------------------------------------------------------------ automatic
+    def auto_candidates(self, memos: list[Memo]) -> list[Memo]:
+        if not self.cfg.flag("VOICEMEMOS_AUTO_TRANSCRIBE"):
+            return []
+        now = self.clock()
+        out = []
+        for memo in memos:
+            if self._status(memo) != "pending":
+                continue
+            path = self.cfg.recordings_dir / memo.filename
+            try:
+                if now - path.stat().st_mtime < self.cfg.min_age_s:
+                    continue  # iCloud may still be writing the file
+                entry = self.state.get(memo.id, {})
+                if entry.get("fp") == _fingerprint(path) and entry.get("attempts", 0) >= self.cfg.max_attempts:
+                    continue
+            except FileNotFoundError:
+                continue
+            out.append(memo)
+        out.sort(key=lambda m: m.recorded or "")
+        return out
+
+    # ------------------------------------------------------------------ run
+    def run(self, dry_run: bool = False, limit: int | None = None, only: list[str] | None = None,
+            redo: bool = False) -> dict:
+        self.store.ensure_dirs()
+        started = now_iso()
+        try:
+            with single_instance(self.store.data_dir / "worker.lock"):
+                return self._run(started, dry_run, limit, only, redo)
+        except Busy as exc:
+            return {"ok": True, "skipped": str(exc)}
+
+    def _run(self, started: str, dry_run: bool, limit: int | None, only: list[str] | None, redo: bool) -> dict:
+        self.state = self.store.read_state()
+        try:
+            memos = read_library(self.cfg.recordings_dir)
+        except LibraryError as exc:
+            summary = {"ok": False, "started": started, "finished": now_iso(), "error": str(exc),
+                       "library_readable": False}
+            if not dry_run:
+                self.store.write_worker(summary)
+            return summary
+
+        summary: dict = {"ok": True, "started": started, "library_readable": True, "memos": len(memos),
+                         "jobs": [], "transcribed": [], "failed": []}
+        if not dry_run:
+            self.store.write_library(self._snapshot(memos))
+
+        if only:
+            targets = self._resolve_request({"memos": only}, memos)
+            for memo in targets[: limit or None]:
+                item = self.transcribe_memo(memo, force=redo, dry_run=dry_run)
+                summary["transcribed" if item["status"] in ("transcribed", "dry_run") else "failed"].append(item)
+        else:
+            if not dry_run:
+                summary["jobs"] = [{"job_id": j["job_id"], "total": j.get("total"), "failed": j.get("failed")}
+                                   for j in self.process_queue(memos)]
+            count = 0
+            for memo in self.auto_candidates(memos):
+                if limit and count >= limit:
+                    break
+                item = self.transcribe_memo(memo, push_roam=True, dry_run=dry_run)
+                bucket = "transcribed" if item["status"] in ("transcribed", "dry_run") else "failed"
+                summary[bucket].append(item)
+                count += 1
+                if not dry_run:
+                    self.store.write_state(self.state)
+
+        if not dry_run:
+            self.store.write_state(self.state)
+            self.store.write_library(self._snapshot(memos))
+            summary["finished"] = now_iso()
+            self.store.write_worker({k: v for k, v in summary.items() if k not in ("transcribed", "failed")}
+                                    | {"transcribed_count": len(summary["transcribed"]),
+                                       "failed_count": len(summary["failed"])})
+        return summary

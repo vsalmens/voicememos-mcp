@@ -1,0 +1,199 @@
+# voicememos-mcp
+
+An MCP server for Apple Voice Memos on macOS. It transcribes memos with
+[Soniox](https://soniox.com) and keeps the speech engine's word-level confidence, so
+uncertain words stay visibly marked instead of being silently guessed. Claude (or any
+MCP client) can then list, read and search the transcripts.
+
+Design goals:
+
+* **A visible guess beats a gap, and a gap beats a confident wrong word.** Every word is
+  kept; low-confidence words are marked.
+* **Least privilege.** Only a small background worker reads the Voice Memos container. The
+  MCP server reads transcript files and holds no secrets.
+* **Lossless storage.** The engine's raw response is stored verbatim next to a canonical
+  word-level JSON. Markdown is rendered from it, so the threshold can change later
+  without paying for a new transcription.
+
+## How it works
+
+```
+iPhone ──iCloud──▶ Voice Memos on the Mac
+                        │  (Full Disk Access, read-only)
+                        ▼
+              worker (launchd)  ── audio ──▶ Soniox  (file and transcript deleted after use)
+                        │
+                        ├─▶ OUTPUT_DIR/2026/2026-10-13_2135_title_1a2b3c4d.{md,json}
+                        ├─▶ DATA_DIR/library.json, state.json, jobs/
+                        └─▶ Roam daily note (optional, append-only token)
+
+Claude ──MCP──▶ voicememos-mcp serve  ── reads ──▶ library.json + transcripts
+                        └── writes ──▶ DATA_DIR/queue/  (picked up by the worker)
+```
+
+The worker runs when the recordings folder or the queue changes, and every 30 minutes.
+
+## Uncertainty notation
+
+| Markdown | Meaning |
+|---|---|
+| `word (?)` | best guess, confidence below the threshold |
+| `[?: w1 w2 w3 w4]` | several consecutive uncertain words (guesses kept) |
+| `{a\|b}` | two plausible readings, more likely first (multi-engine, planned) |
+| `[?]` | something was said, nothing usable was recognised |
+
+This follows conversation-analysis (Jefferson) practice, where `(word)` marks an
+uncertain hearing, `(a)/(b)` alternative hearings and `( )` unhearable talk.
+
+Each transcript's JSON keeps, per word, `conf` (0..1), optional ranked `alts`, and a
+`basis` explaining where the uncertainty comes from:
+
+* `asr_confidence`: measured by the speech engine,
+* `reader_disagreement`: independent engines disagreed,
+* `self_report`: a model said it was unsure (not calibrated).
+
+The semantics match PAGE XML (`TextEquiv@conf`, alternatives ranked by `index`) and can be
+exported to TEI (`<unclear cert>`, `<choice>`) or ALTO (`WC`, `ALTERNATIVE`). No existing
+standard keeps everything a speech engine returns (sub-word tokens, per-token language,
+timings), which is why the raw response is stored as well.
+
+Transcripts start with a short reading guide that asks language models not to present
+marked words as certain, and to propose corrections visibly (`word→suggestion (?)`).
+
+## Requirements
+
+* macOS 14 or later with Voice Memos iCloud sync enabled on the iPhone and the Mac
+  (open Voice Memos on the Mac once).
+* [uv](https://docs.astral.sh/uv/)
+* A Soniox API key.
+* Optional: `ffmpeg` for lossless `.qta` handling (otherwise `afconvert` is used).
+
+## Install
+
+```bash
+git clone https://github.com/<you>/voicememos-mcp.git
+cd voicememos-mcp
+./install.sh          # creates ~/.config/voicememos-mcp/config.env on the first run
+$EDITOR ~/.config/voicememos-mcp/config.env
+./install.sh          # again, to apply the configuration
+```
+
+`install.sh` installs the MCP server with `uv tool`, creates a separate virtualenv for the
+worker, stores the Soniox key in the Keychain, installs the launchd job and adds this to
+`claude_desktop_config.json`:
+
+```json
+"voicememos": { "command": "/Users/<you>/.local/bin/voicememos-mcp", "args": ["serve"] }
+```
+
+### Full Disk Access
+
+The Voice Memos container is protected by macOS privacy controls. The worker's
+interpreter needs Full Disk Access; `install.sh` prints its path and opens the settings
+pane. Grant it, then run `launchctl kickstart -k gui/$(id -u)/local.voicememos-mcp.sync`.
+
+Notes:
+
+* macOS grants the permission to the interpreter binary, so every script run with that
+  same binary gets it. The worker therefore uses its own virtualenv and, by default, a
+  uv-managed Python (`VOICEMEMOS_WORKER_PYTHON`, default 3.13). For stronger isolation,
+  pick a Python version nothing else on the machine uses.
+* The MCP server does not need Full Disk Access. Do not grant it to Claude Desktop: every
+  local MCP server it starts would inherit it.
+
+Check the setup with `voicememos-mcp check` (from Terminal; Terminal may have different
+permissions than the launchd job) and the worker log in
+`~/Library/Application Support/voicememos-mcp/logs/`.
+
+## Configuration
+
+All settings are in `~/.config/voicememos-mcp/config.env`; see
+[`config.example.env`](config.example.env) for every option. The most important:
+
+| Setting | Default | |
+|---|---|---|
+| `VOICEMEMOS_LANGUAGES` | `en` | language hints, e.g. `fi,en` |
+| `VOICEMEMOS_CONTEXT_TERMS` | | names and rare terms the engine should know |
+| `VOICEMEMOS_CONF_THRESHOLD` | `0.70` | words below this are marked |
+| `VOICEMEMOS_OUTPUT_DIR` | `~/Documents/Voice Memo Transcripts` | |
+| `VOICEMEMOS_SINCE` | | only auto-transcribe memos from this date on |
+| `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
+| `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
+| `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence |
+| `VOICEMEMOS_ROAM_ENABLED` | `0` | append new transcripts to Roam daily notes |
+
+Excluded memos are never transcribed, and the MCP tools cannot see them, not even their
+titles.
+
+## MCP tools
+
+| Tool | |
+|---|---|
+| `voicememos_status` | counts by status, worker health, configuration, warnings |
+| `voicememos_list` | memos newest first; filter by date, title, status; paging |
+| `voicememos_read` | one transcript as Markdown, plain text or word-level JSON; optional `threshold` re-renders without re-transcribing; paging for long memos |
+| `voicememos_search` | case-insensitive search (or regex) over transcripts and titles, with snippets |
+| `voicememos_markers` | sentences tagged with a spoken marker ("Idea: ...") across memos |
+| `voicememos_transcribe` | queue memos (by id or date range) for background transcription; returns a job id |
+| `voicememos_transcribe_status` | job progress, or recent jobs |
+
+Memo status values: `transcribed`, `pending` (will be transcribed automatically),
+`not_transcribed` (outside `VOICEMEMOS_SINCE`; use `voicememos_transcribe`),
+`not_downloaded` (audio still in iCloud; play it once in Voice Memos on the Mac),
+`failed` (after `VOICEMEMOS_MAX_ATTEMPTS` tries), `too_long`, `deleted`.
+
+## Command line
+
+```bash
+voicememos-mcp check                         # paths, permissions, keys
+voicememos-mcp sync --dry-run --limit 1      # one memo, print only, save nothing
+voicememos-mcp sync --memo 1a2b3c4d --redo   # transcribe one memo again
+voicememos-mcp transcribe-file memo.m4a --threshold 0.6 --threshold 0.8   # calibration
+voicememos-mcp launchd-plist                 # print the launchd job definition
+```
+
+## Calibrating the threshold
+
+Pick 5-10 different recordings (quiet room, car, mixed languages) and run
+`transcribe-file` with thresholds 0.6, 0.7 and 0.8. Choose the value at which wrong words
+stop slipping through unmarked. Extra marks on correct words are cheap; an unmarked wrong
+word is expensive. `voicememos_read(..., threshold=...)` lets you compare on stored
+transcripts without new API calls.
+
+## Privacy and security
+
+* Audio goes to Soniox for transcription. The uploaded file and the transcription are
+  deleted from Soniox right after the transcript is fetched, also when something fails.
+  Soniox offers an EU endpoint (`SONIOX_BASE_URL=https://api.eu.soniox.com`), which needs an
+  EU project.
+* Nothing in the Voice Memos container is modified. The database is opened read-only.
+* Secrets live in the Keychain or the environment. The package never writes them to a file
+  (you can put them in `config.env` yourself, but the Keychain is the safer place).
+* With the default `VOICEMEMOS_WORKER=launchd`, the MCP server has no secrets and no access
+  to Voice Memos; it can only queue requests. In `inprocess` mode it does both itself.
+* Roam uses an append-only token, which cannot read or delete anything.
+
+## Limitations
+
+* Tested with the Voice Memos database of macOS 26. Column names are detected at runtime,
+  but older or newer versions may differ.
+* Memos whose audio has not been downloaded from iCloud cannot be transcribed until they
+  are played once on the Mac.
+* Soniox limits a single file to about 300 minutes.
+* The Roam Append API request format follows public examples; test with one memo first.
+
+## Roadmap
+
+* Second engine and disagreement marking (`{a|b}`, `basis: reader_disagreement`).
+* Export to TEI (spoken text) and WebVTT.
+
+## Development
+
+```bash
+uv venv && uv pip install -e ".[test]"
+.venv/bin/pytest
+```
+
+## License
+
+MIT

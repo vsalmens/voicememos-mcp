@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "voicememos-mcp"
+version = "0.1.0"
+description = "MCP server for Apple Voice Memos with transcription that marks uncertain words"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2",
+    "requests>=2.31",
+]
+classifiers = [
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+voicememos-mcp = "voicememos_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voicememos_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
