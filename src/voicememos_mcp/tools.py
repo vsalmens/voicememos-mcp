@@ -61,6 +61,29 @@ class Tools:
         self.store = store or Store(cfg.data_dir, cfg.output_dir)
 
     # ------------------------------------------------------------------ helpers
+    def _permission_hint(self) -> str:
+        return (f"macOS denied access to {self.cfg.output_dir} for the app that runs this MCP server "
+                "(for example Claude Desktop). Allow it in System Settings > Privacy & Security > Files and "
+                "Folders (the 'Documents Folder' switch for that app, if the folder is in Documents), or set "
+                "VOICEMEMOS_OUTPUT_DIR to a folder outside Documents, Desktop, Downloads and iCloud Drive; "
+                "then restart the app.")
+
+    def _load_transcript(self, relative_json: str) -> dict | None:
+        try:
+            return self.store.load_transcript(relative_json)
+        except PermissionError as exc:
+            raise ToolError(self._permission_hint()) from exc
+
+    def _output_readable(self) -> bool | None:
+        """False when macOS privacy controls block the transcript folder; None when it does not exist yet."""
+        try:
+            os.listdir(self.cfg.output_dir)
+            return True
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            return False
+
     def _memos(self, include_deleted: bool = False) -> list[dict]:
         memos = self.store.read_library().get("memos", [])
         return [m for m in memos if include_deleted or not m.get("deleted")]
@@ -118,6 +141,9 @@ class Tools:
                     warnings.append(f"Last worker run was {age_h:.0f} h ago; the launchd job may not be running.")
             except (TypeError, ValueError):
                 pass
+        output_readable = self._output_readable()
+        if output_readable is False:
+            warnings.append(self._permission_hint())
         return {
             "library_updated": library.get("updated"),
             "memos": len(memos),
@@ -126,6 +152,7 @@ class Tools:
             "worker": worker,
             "queued_requests": len(self.store.pending_requests()) if self.store.queue_dir.exists() else 0,
             "output_dir": str(self.cfg.output_dir),
+            "output_readable": output_readable,
             "engine": {"model": self.cfg.get("SONIOX_MODEL"), "languages": self.cfg.languages,
                        "threshold": self.cfg.threshold},
             "auto_transcribe": self.cfg.flag("VOICEMEMOS_AUTO_TRANSCRIBE"),
@@ -157,7 +184,7 @@ class Tools:
         if not transcript:
             return {**info, "text": None,
                     "note": "not transcribed yet; call voicememos_transcribe with this id"}
-        data = self.store.load_transcript(transcript["json"])
+        data = self._load_transcript(transcript["json"])
         if data is None:
             raise ToolError("transcript file is missing; run voicememos_transcribe with redo=true")
         thr = float(threshold) if threshold is not None else self.cfg.threshold
@@ -197,7 +224,7 @@ class Tools:
             snippets = []
             transcript = memo.get("transcript")
             if transcript:
-                data = self.store.load_transcript(transcript["json"]) or {}
+                data = self._load_transcript(transcript["json"]) or {}
                 text = " ".join(notation.render_blocks(data.get("words", []), self.cfg.threshold,
                                                        self.cfg.run_min, self.cfg.pause_ms))
                 for match in pattern.finditer(text):

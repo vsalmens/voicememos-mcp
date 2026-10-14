@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from . import __version__
 from .config import load_config
 from .notation import READER_NOTE
 from .tools import ToolError, Tools
+
+log = logging.getLogger(__name__)
 
 try:  # mcp >= 2
     from mcp.server.mcpserver import MCPServer as _Server
@@ -30,6 +33,14 @@ def build_server(tools: Tools | None = None):
             return fn(*args, **kwargs)
         except ToolError as exc:
             return {"error": str(exc)}
+        except PermissionError as exc:
+            log.exception("permission denied in %s", getattr(fn, "__name__", fn))
+            return {"error": f"permission denied: {exc}. If the path is in Documents, Desktop, Downloads or "
+                             "iCloud Drive, allow the app that runs this server in System Settings > Privacy & "
+                             "Security > Files and Folders, or move the folder."}
+        except Exception as exc:  # noqa: BLE001 - report the cause instead of a bare "Error executing tool"
+            log.exception("unexpected error in %s", getattr(fn, "__name__", fn))
+            return {"error": f"internal error ({type(exc).__name__}): {exc}"}
 
     @server.tool()
     def voicememos_status() -> dict:

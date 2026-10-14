@@ -35,3 +35,35 @@ def test_launchd_plist_watches_recordings_and_queue(cfg):
 def test_launchd_plist_can_use_launcher(cfg):
     plist = launchd_plist(cfg, ["/opt/x/voicememos-worker"])
     assert "<array><string>/opt/x/voicememos-worker</string></array>" in plist
+
+
+def _call(server, name, args):
+    result = asyncio.run(server.call_tool(name, args))
+    return str(result)
+
+
+def test_unexpected_errors_are_reported_with_their_cause(cfg, monkeypatch):
+    tools = Tools(cfg)
+    monkeypatch.setattr(tools, "read", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk on fire")))
+    out = _call(build_server(tools), "voicememos_read", {"memo": "aaaa1111"})
+    assert "internal error (RuntimeError): disk on fire" in out
+
+
+def test_blocked_transcript_folder_is_explained(cfg, monkeypatch):
+    from voicememos_mcp import tools as tools_module
+    from voicememos_mcp.worker import Worker
+    from tests.conftest import FakeTranscriber
+
+    Worker(cfg, transcriber=FakeTranscriber()).run()
+    tools = Tools(cfg)
+
+    def denied(*_a, **_k):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(tools.store, "load_transcript", denied)
+    monkeypatch.setattr(tools_module.os, "listdir", denied)
+    status = tools.status()
+    assert status["output_readable"] is False
+    assert any("Files and Folders" in w for w in status["warnings"])
+    out = _call(build_server(tools), "voicememos_read", {"memo": "aaaa1111"})
+    assert "Files and Folders" in out and "Error executing tool" not in out
