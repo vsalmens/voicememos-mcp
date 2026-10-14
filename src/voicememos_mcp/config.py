@@ -31,7 +31,7 @@ RECORDINGS_DIR_CANDIDATES = (
 DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_RECORDINGS_DIR": "",
     "VOICEMEMOS_DATA_DIR": "~/Library/Application Support/voicememos-mcp",
-    "VOICEMEMOS_OUTPUT_DIR": "~/Documents/Voice Memo Transcripts",
+    "VOICEMEMOS_OUTPUT_DIR": "~/Library/Application Support/voicememos-mcp/transcripts",
     "VOICEMEMOS_LANGUAGES": "en",
     "VOICEMEMOS_CONTEXT_TERMS": "",
     "VOICEMEMOS_CONTEXT_TEXT": "",

@@ -153,6 +153,22 @@ worker, stores the Soniox key in the Keychain, installs the launchd job and adds
 "voicememos": { "command": "/Users/<you>/.local/bin/voicememos-mcp", "args": ["serve"] }
 ```
 
+### Where transcripts live
+
+macOS protects Documents, Desktop, Downloads and iCloud Drive. MCP servers started by Claude
+Desktop do not appear to inherit the app's own permissions, so the server could not read
+transcripts kept there (`voicememos_status` then reports `output_readable: false`). The default
+folder is therefore `~/Library/Application Support/voicememos-mcp/transcripts`, which needs no
+permission. To see the transcripts in Documents, add a symbolic link; the files stay where the
+server can read them:
+
+```bash
+ln -s ~/Library/Application\ Support/voicememos-mcp/transcripts ~/Documents/voice-memos
+```
+
+Finder and editors follow the link. Spotlight and iCloud Drive generally do not follow symbolic
+links, so the transcripts are not indexed there or uploaded with Documents.
+
 ### Full Disk Access
 
 The Voice Memos container is protected by macOS privacy controls. Only the worker needs
@@ -195,7 +211,7 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_LANGUAGES` | `en` | language hints, e.g. `fi,en` |
 | `VOICEMEMOS_CONTEXT_TERMS` | | names and rare terms the engine should know |
 | `VOICEMEMOS_CONF_THRESHOLD` | `0.70` | words below this are marked |
-| `VOICEMEMOS_OUTPUT_DIR` | `~/Documents/Voice Memo Transcripts` | |
+| `VOICEMEMOS_OUTPUT_DIR` | `~/Library/Application Support/voicememos-mcp/transcripts` | outside Documents on purpose, see [Where transcripts live](#where-transcripts-live) |
 | `VOICEMEMOS_SINCE` | | only auto-transcribe memos from this date on |
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
