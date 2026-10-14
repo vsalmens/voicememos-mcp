@@ -106,6 +106,8 @@ class Tools:
                             "'voicememos-mcp sync'.")
         elif not worker.get("library_readable", True):
             warnings.append(f"Worker cannot read Voice Memos: {worker.get('error')}")
+        elif worker.get("running"):
+            pass  # a run is in progress; library.json is refreshed every few memos
         else:
             last = worker.get("finished") or worker.get("started")
             try:

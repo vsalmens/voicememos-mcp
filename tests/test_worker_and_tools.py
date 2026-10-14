@@ -176,3 +176,17 @@ def test_dry_run_saves_nothing(cfg, fake):
     assert summary["transcribed"][0]["status"] == "dry_run"
     assert not (cfg.data_dir / "library.json").exists()
     assert not list(cfg.output_dir.rglob("*.md"))
+
+
+def test_worker_marks_itself_running_and_publishes_progress(cfg, monkeypatch):
+    seen = []
+
+    class Spy(FakeTranscriber):
+        def __call__(self, audio):
+            seen.append(json.loads((cfg.data_dir / "worker.json").read_text()).get("running"))
+            return super().__call__(audio)
+
+    run(cfg, Spy())
+    assert seen and all(seen)
+    final = json.loads((cfg.data_dir / "worker.json").read_text())
+    assert "running" not in final and final["transcribed_count"] == 2

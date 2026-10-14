@@ -426,6 +426,8 @@ class Worker:
                          "jobs": [], "transcribed": [], "failed": []}
         if not dry_run:
             self.store.write_library(self._snapshot(memos))
+            self.store.write_worker({"ok": True, "running": True, "started": started, "library_readable": True,
+                                     "memos": len(memos)})
 
         if only:
             targets = self._resolve_request({"memos": only}, memos)
@@ -446,6 +448,8 @@ class Worker:
                 count += 1
                 if not dry_run:
                     self.store.write_state(self.state)
+                    if count % 5 == 0:  # let the MCP tools see progress during long runs
+                        self.store.write_library(self._snapshot(memos))
 
         if not dry_run:
             self.store.write_state(self.state)
