@@ -4,7 +4,8 @@ One run (``voicememos-mcp sync``):
 
 1. read the library database and write a snapshot to ``library.json``,
 2. process queued transcription requests from the MCP server,
-3. transcribe new memos automatically (if enabled),
+3. transcribe new memos automatically (if enabled); memos longer than the engine accepts are
+   cut into parts, transcribed part by part (resumable) and merged (``segment.py``),
 4. optionally append new transcripts to Roam,
 5. record the result in ``worker.json``.
 
@@ -17,17 +18,19 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import logging
+import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import Callable
 
-from . import align, notation, roam
-from .audio import cut_audio, prepare_audio
+from . import align, notation, roam, segment
+from .audio import cut_audio, find_tool, prepare_audio
 from .config import Config
 from .library import LibraryError, Memo, is_excluded, read_library
-from .store import Store, now_iso
+from .store import Store, now_iso, read_json, write_json_atomic
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +40,12 @@ SecondReader = Callable[[Path], dict]
 
 class Busy(RuntimeError):
     pass
+
+
+def _bucket(item: dict) -> str:
+    if item["status"] in ("transcribed", "dry_run"):
+        return "transcribed"
+    return "skipped" if item["status"] == "too_long" else "failed"
 
 
 @contextlib.contextmanager
@@ -56,7 +65,9 @@ def soniox_transcriber(cfg: Config) -> Transcriber:
     key = cfg.secret("SONIOX_API_KEY")
     if not key:
         raise RuntimeError("SONIOX_API_KEY is not set (environment or Keychain)")
-    client = Soniox(key, cfg.get("SONIOX_BASE_URL"), cfg.get("SONIOX_MODEL"))
+    # Allow for the longest file the engine takes (a part of a segmented memo is close to it).
+    client = Soniox(key, cfg.get("SONIOX_BASE_URL"), cfg.get("SONIOX_MODEL"),
+                    poll_timeout=max(1800.0, cfg.max_duration_s / 2))
 
     def transcribe(audio: Path) -> list[dict]:
         return client.transcribe(audio, cfg.languages, cfg.context_terms, cfg.context_text,
@@ -153,6 +164,22 @@ class Worker:
         limit_ms = float(self.cfg.get("VOICEMEMOS_SECOND_READER_MAX_MIN")) * 60_000
         duration_ms = (memo.duration_s or 0) * 1000 or (words[-1].get("end_ms") or 0 if words else 0)
         return duration_ms > limit_ms
+
+    def is_too_long(self, memo: Memo) -> bool:
+        """Longer than the primary engine accepts in one file (``VOICEMEMOS_MAX_DURATION_MIN``)."""
+        return bool(memo.duration_s and memo.duration_s > self.cfg.max_duration_s)
+
+    def segment_problem(self) -> str | None:
+        """Why too long memos cannot be split, or None when they can."""
+        if not self.cfg.flag("VOICEMEMOS_SEGMENT_LONG"):
+            return "splitting is off (VOICEMEMOS_SEGMENT_LONG=0)"
+        if not find_tool("ffmpeg") or not find_tool("ffprobe"):
+            return "ffmpeg/ffprobe not found (searched /opt/homebrew/bin, /usr/local/bin and PATH)"
+        return None
+
+    def too_long_reason(self, memo: Memo) -> str:
+        return (f"{memo.duration_s / 60:.0f} min is longer than VOICEMEMOS_MAX_DURATION_MIN "
+                f"({self.cfg.max_duration_s / 60:g} min) and {self.segment_problem()}")
 
     def _apply_second_reader(self, reader: SecondReader, audio: Path, memo: Memo, words: list[dict],
                              only_uncertain: bool = False) -> tuple[list[dict], dict]:
@@ -261,6 +288,60 @@ class Worker:
             log.exception("Voiceprint identification failed")
             return speakers, {"name": voiceprint.get("name"), "result": "error", "error": str(exc)[:200]}
 
+    def _identify_parts(self, audio: Path, words: list[dict], bounds_s: list[float]) -> tuple[dict, dict | None]:
+        """The voiceprint for a memo transcribed in parts: every part is scored on its own, because
+        the engine's speaker labels hold within one part only. Never raises."""
+        from .voiceprint import Voiceprint, as_reader, identify
+
+        speakers = segment.speaker_labels(words)
+        voiceprint = Voiceprint(self.store.voiceprint_path).load()
+        if not voiceprint:
+            return speakers, None
+        name, model = voiceprint.get("name"), self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL")
+        if voiceprint.get("model") != model:
+            return speakers, {"name": name, "result": "error",
+                              "error": f"the voiceprint was made with {voiceprint.get('model')}, but the "
+                                       f"configured model is {model}; enroll again"}
+        try:
+            read, embed = as_reader(self.load_audio(audio)), self.embedder()
+            parts = []
+            for k, part_words in enumerate(segment.split_words(words, bounds_s)):
+                local = {key: v for key, v in speakers.items() if key.startswith(f"{k + 1}:")}
+                # Word times are absolute; a read from 0 (the fallback without word timings) means this part.
+                in_part = lambda start, duration, a=bounds_s[k]: read(max(start, a), duration)  # noqa: E731
+                updated, summary = identify(in_part, part_words, local if len(local) > 1 else {}, voiceprint, embed)
+                if len(local) > 1:
+                    speakers.update(updated)
+                elif len(local) == 1 and summary.get("score") is not None:
+                    # One speaker in this part, others in other parts: the part's score is that speaker's.
+                    key = next(iter(local))
+                    speakers[key] = dict(speakers[key], voiceprint=summary["score"])
+                    if summary["result"] in ("match", "possible"):
+                        speakers[key].update(label=name if summary["result"] == "match" else f"{name} (?)",
+                                             basis="voiceprint")
+                        summary["speaker"] = key
+                parts.append({"part": k + 1, **{x: summary[x] for x in ("result", "score", "scores", "speaker")
+                                                if summary.get(x) is not None}})
+        except Exception as exc:  # noqa: BLE001 - the transcript must survive
+            log.exception("Voiceprint identification failed")
+            return speakers, {"name": name, "result": "error", "error": str(exc)[:200]}
+        summary = {"name": name, "thresholds": voiceprint["thresholds"], "parts": parts}
+        if speakers:  # the owner found in some part
+            found = [p for p in parts if p.get("speaker")]
+            match = next((p for p in found if p["result"] == "match"), found[0] if found else None)
+            summary.update(result=match["result"] if match else "no match",
+                           **({"speaker": match["speaker"]} if match else {}))
+            return speakers, summary
+        scores = [p["score"] for p in parts if p.get("score") is not None]
+        if not scores:
+            return speakers, {**summary, "score": None, "result": "too little speech"}
+        score = round(sum(scores) / len(scores), 4)
+        thresholds = voiceprint["thresholds"]
+        result = "match" if score >= thresholds["match"] else "possible" if score >= thresholds["maybe"] else "no match"
+        if result == "match" and any(p["result"] != "match" for p in parts):
+            result = "possible"  # not every part sounds like the owner
+        return speakers, {**summary, "score": score, "result": result}
+
     def enroll_voiceprint(self, memos: list[Memo], name: str) -> dict:
         from .voiceprint import Voiceprint, enroll
 
@@ -346,7 +427,10 @@ class Worker:
             words = data.get("words", [])
             with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
                 audio = prepare_audio(self.cfg.recordings_dir / memo.filename, Path(tmp))
-                speakers, summary = self._identify(audio, words, notation.speaker_labels(words))
+                if data.get("segments"):
+                    speakers, summary = self._identify_parts(audio, words, data["segments"]["bounds_s"])
+                else:
+                    speakers, summary = self._identify(audio, words, notation.speaker_labels(words))
             if summary is None:
                 return {**item, "status": "failed", "error": "no voiceprint enrolled"}
             if summary.get("result") == "error":
@@ -375,8 +459,14 @@ class Worker:
             return "not_downloaded"
         if entry.get("attempts", 0) >= self.cfg.max_attempts:
             return "failed"
-        if memo.duration_s and memo.duration_s > self.cfg.max_duration_s:
-            return "too_long"
+        if self.is_too_long(memo):
+            if self.segment_problem():
+                return "too_long"
+            plan = entry.get("segments")
+            if plan:  # parts in progress; exhausted parts make the memo fail like a single file would
+                exhausted = any(p["status"] != "done" and p.get("attempts", 0) >= self.cfg.max_attempts
+                                for p in plan["parts"])
+                return "failed" if exhausted else "segmenting"
         if self.cfg.since and not _in_range(memo, self.cfg.since, None):
             return "not_transcribed"
         return "pending" if self.cfg.flag("VOICEMEMOS_AUTO_TRANSCRIBE") else "not_transcribed"
@@ -396,6 +486,14 @@ class Worker:
                                                                 "voiceprint")}
             elif entry.get("error"):
                 item["error"] = entry["error"]
+            if not entry.get("ok") and entry.get("segments"):
+                parts = entry["segments"]["parts"]
+                item["segments"] = {"done": sum(p["status"] == "done" for p in parts), "total": len(parts)}
+                failed = next((p for p in parts if p.get("error") and p["status"] != "done"), None)
+                if failed and not item.get("error"):
+                    item["error"] = failed["error"]
+            elif item["status"] == "too_long":
+                item["error"] = self.too_long_reason(memo)
             items.append(item)
         return {"updated": now_iso(), "recordings_dir": str(self.cfg.recordings_dir),
                 "excluded_count": excluded, "memos": items}
@@ -418,57 +516,164 @@ class Worker:
         if not force and entry.get("ok") and entry.get("fp") == fingerprint:
             return {**item, "status": "already_transcribed", "markdown": entry.get("markdown")}
 
+        if self.is_too_long(memo) and self.segment_problem():
+            reason = self.too_long_reason(memo)
+            log.warning("Not transcribing %s: %s", memo.id, reason)
+            return {**item, "status": "too_long", "error": reason}
         try:
-            second_record = None
+            if self.is_too_long(memo):
+                if dry_run:
+                    return self._plan_only(memo, path, item)
+                return self._transcribe_segmented(memo, path, fingerprint, entry, item, force, push_roam)
             with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
                 audio = prepare_audio(path, Path(tmp))
                 tokens = self.transcriber(audio)
                 words, had_confidence = notation.tokens_to_words(tokens)
-                reader = None if dry_run else self.second_reader()
-                long = self.is_long(memo, words)
-                if reader is not None and (long or self.wants_second_read(words)):
-                    only_uncertain = self.cfg.get("VOICEMEMOS_SECOND_READER") == "gemini-low"
-                    words, second_record = self._apply_second_reader(reader, audio, memo, words, only_uncertain)
-                speakers = notation.speaker_labels(words)
-                voice = None
-                if not dry_run:
-                    speakers, voice = self._identify(audio, words, speakers)
-            if dry_run:
-                text = "\n\n".join(notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min,
-                                                          self.cfg.pause_ms, speakers))
-                return {**item, "status": "dry_run", "stats": notation.stats(words, self.cfg.threshold),
-                        "text": text, "confidence_available": had_confidence}
-            engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
-                      "language_hints": self.cfg.languages}
-            extra = {"language": align.dominant_language(words), "speakers": speakers, "voiceprint": voice,
-                     "readers": [{"role": "primary", **engine, "created": now_iso()}]
-                     + ([second_record] if second_record else [])}
-            result = self.store.write_transcript(
-                memo.to_dict(), words, engine, had_confidence, self.cfg.threshold,
-                self.cfg.run_min, self.cfg.pause_ms, self.cfg.marker_spec, source_tokens=tokens, extra=extra,
-            )
-            result["language"] = extra["language"]
-            result["speakers"] = len(speakers)
-            if voice:
-                result["voiceprint"] = _vp_short(voice)
-            if second_record and not second_record.get("error"):
-                result["second_reader"] = {"model": second_record.get("model"),
-                                           "agreement": second_record["agreement"]["agreement"]}
-            new_entry = {"fp": fingerprint, "ok": True, "at": now_iso(), **result}
-            if entry.get("roam"):
-                new_entry["roam"] = entry["roam"]
-            self.state[memo.id] = new_entry
-            item.update(status="transcribed", markdown=result["markdown"], stats=result["stats"])
-            if push_roam and self.cfg.flag("VOICEMEMOS_ROAM_ENABLED") and not new_entry.get("roam"):
-                self._push_roam(memo, words, result, new_entry, item)
-            return item
+                if dry_run:
+                    text = "\n\n".join(notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min,
+                                                              self.cfg.pause_ms, notation.speaker_labels(words)))
+                    return {**item, "status": "dry_run", "stats": notation.stats(words, self.cfg.threshold),
+                            "text": text, "confidence_available": had_confidence}
+                return self._finish(memo, item, entry, fingerprint, audio, words, had_confidence, tokens, push_roam)
         except Exception as exc:  # noqa: BLE001 - one failing memo must not stop the run
             log.exception("Transcription failed for %s", memo.id)
             if not dry_run:
-                self.state[memo.id] = {**entry, "ok": False, "fp": fingerprint,
-                                       "attempts": entry.get("attempts", 0) + 1, "error": str(exc)[:300],
+                current = self.state.get(memo.id, entry)  # keeps the progress of a memo in parts
+                self.state[memo.id] = {**current, "ok": False, "fp": fingerprint,
+                                       "attempts": current.get("attempts", 0) + 1, "error": str(exc)[:300],
                                        "at": now_iso()}
             return {**item, "status": "failed", "error": str(exc)[:300]}
+
+    def _finish(self, memo: Memo, item: dict, entry: dict, fingerprint: str, audio: Path, words: list[dict],
+                had_confidence: bool, tokens: list[dict], push_roam: bool, segments: dict | None = None) -> dict:
+        """Second reader, voiceprint, transcript files and state for a fresh primary transcript."""
+        second_record = None
+        reader = self.second_reader()
+        if reader is not None:
+            total_min = float(self.cfg.get("VOICEMEMOS_SECOND_READER_MAX_TOTAL_MIN") or 0)
+            duration_min = (memo.duration_s or 0) / 60
+            if total_min and duration_min > total_min:
+                reason = (f"the recording is {duration_min:.0f} min, longer than "
+                          f"VOICEMEMOS_SECOND_READER_MAX_TOTAL_MIN ({total_min:g} min)")
+                log.warning("Second reader skipped for %s: %s", memo.id, reason)
+                second_record = {"role": "second", "provider": "gemini", "created": now_iso(),
+                                 "skipped": reason, "error": f"skipped: {reason}"}
+            elif self.is_long(memo, words) or self.wants_second_read(words):
+                only_uncertain = self.cfg.get("VOICEMEMOS_SECOND_READER") == "gemini-low"
+                words, second_record = self._apply_second_reader(reader, audio, memo, words, only_uncertain)
+        if segments:
+            speakers, voice = self._identify_parts(audio, words, segments["bounds_s"])
+        else:
+            speakers, voice = self._identify(audio, words, notation.speaker_labels(words))
+        engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
+                  "language_hints": self.cfg.languages}
+        extra = {"language": align.dominant_language(words), "speakers": speakers, "voiceprint": voice,
+                 "readers": [{"role": "primary", **engine, "created": now_iso()}]
+                 + ([second_record] if second_record else [])}
+        if segments:
+            extra["segments"] = segments
+        result = self.store.write_transcript(
+            memo.to_dict(), words, engine, had_confidence, self.cfg.threshold,
+            self.cfg.run_min, self.cfg.pause_ms, self.cfg.marker_spec, source_tokens=tokens, extra=extra,
+        )
+        result["language"] = extra["language"]
+        result["speakers"] = len(speakers)
+        if voice:
+            result["voiceprint"] = _vp_short(voice)
+        if second_record and not second_record.get("error"):
+            result["second_reader"] = {"model": second_record.get("model"),
+                                       "agreement": second_record["agreement"]["agreement"]}
+        new_entry = {"fp": fingerprint, "ok": True, "at": now_iso(), **result}
+        if entry.get("roam"):
+            new_entry["roam"] = entry["roam"]
+        self.state[memo.id] = new_entry
+        item.update(status="transcribed", markdown=result["markdown"], stats=result["stats"])
+        if segments:
+            item["segments"] = segments["count"]
+        if push_roam and self.cfg.flag("VOICEMEMOS_ROAM_ENABLED") and not new_entry.get("roam"):
+            self._push_roam(memo, words, result, new_entry, item)
+        return item
+
+    # ------------------------------------------------------------------ memos in parts
+    def _plan(self, memo: Memo, audio: Path) -> list[float]:
+        window = float(self.cfg.get("VOICEMEMOS_SEGMENT_SILENCE_WINDOW_MIN") or 0) * 60
+        return segment.plan_bounds(memo.duration_s, self.cfg.segment_max_s, window, audio=audio)
+
+    def _plan_only(self, memo: Memo, path: Path, item: dict) -> dict:
+        """Dry run of a memo in parts: where it would be cut, without calling the engine."""
+        with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+            bounds = self._plan(memo, prepare_audio(path, Path(tmp)))
+        cuts = ", ".join(segment.clock(b) for b in bounds[1:-1])
+        return {**item, "status": "dry_run", "stats": notation.stats([], self.cfg.threshold), "segments": bounds,
+                "text": f"(not transcribed in a dry run: {len(bounds) - 1} parts, cut at {cuts})"}
+
+    def _transcribe_segmented(self, memo: Memo, path: Path, fingerprint: str, entry: dict, item: dict,
+                              force: bool, push_roam: bool) -> dict:
+        """Transcribe a too long memo in parts. Each part is its own job; finished parts are kept
+        (raw tokens in ``tmp/<memo id>/``), so a failed part is the only one tried again."""
+        workdir = self.store.tmp_dir / memo.id
+        plan = entry.get("segments")
+        if force or not plan or plan.get("fp") != fingerprint:
+            shutil.rmtree(workdir, ignore_errors=True)  # a new plan: earlier parts no longer fit
+            plan = None
+        workdir.mkdir(parents=True, exist_ok=True)
+        audio = prepare_audio(path, workdir)
+        if plan is None:
+            bounds = self._plan(memo, audio)
+            plan = {"fp": fingerprint, "bounds_s": bounds, "created": now_iso(),
+                    "parts": [{"status": "pending", "attempts": 0} for _ in bounds[1:]]}
+            log.info("Memo %s is %.0f min, longer than %g min: %d parts, cut at %s", memo.id,
+                     memo.duration_s / 60, self.cfg.max_duration_s / 60, len(bounds) - 1,
+                     ", ".join(segment.clock(b) for b in bounds[1:-1]))
+        self.state[memo.id] = {**entry, "segments": plan}
+        self.store.write_state(self.state)
+        bounds, n = plan["bounds_s"], len(plan["parts"])
+        for k, part in enumerate(plan["parts"]):
+            tokens_file = workdir / f"part{k + 1}.tokens.json"
+            if part["status"] == "done" and tokens_file.exists():
+                continue
+            end_s = bounds[k + 1] if k + 1 < n else None  # the last part runs to the end of the file
+            job_id = hashlib.sha1(f"{memo.id}:{fingerprint}:{k}".encode()).hexdigest()[:12]
+            job = self.store.read_job(job_id) or {"job_id": job_id, "created": now_iso()}
+            job.update(status="running", started=now_iso(), total=1, done=0, failed=0,
+                       request={"action": "transcribe_part", "memos": [memo.id], "part": k + 1, "of": n,
+                                "start_s": bounds[k], "end_s": bounds[k + 1]},
+                       items=[{"short_id": memo.short_id, "title": memo.title, "recorded": memo.recorded,
+                               "status": "running"}])
+            job.pop("error", None)
+            self.store.write_job(job)
+            try:
+                clip = workdir / f"part{k + 1}.m4a"
+                if not clip.exists():
+                    partial = workdir / f"part{k + 1}.partial.m4a"
+                    segment.cut_part(audio, bounds[k], end_s, partial)
+                    partial.replace(clip)
+                tokens = self.transcriber(clip)
+                write_json_atomic(tokens_file, tokens)
+                part.update(status="done", at=now_iso())
+                part.pop("error", None)
+                job.update(status="done", done=1)
+            except Exception as exc:  # noqa: BLE001 - the other parts are kept
+                log.exception("Part %d/%d of %s failed", k + 1, n, memo.id)
+                part.update(status="failed", attempts=part.get("attempts", 0) + 1, error=str(exc)[:300], at=now_iso())
+                job.update(status="done", done=1, failed=1, error=str(exc)[:300])
+            job["items"][0].update(status="transcribed" if part["status"] == "done" else "failed",
+                                   error=part.get("error"))
+            job["finished"] = now_iso()
+            self.store.write_job(job)
+            self.store.write_state(self.state)
+        missing = [k for k, p in enumerate(plan["parts"]) if p["status"] != "done"]
+        if missing:
+            return {**item, "status": "failed", "segments": n,
+                    "error": f"part {missing[0] + 1}/{n} failed: {plan['parts'][missing[0]].get('error')} "
+                             "(the next run tries only the missing parts)"}
+        parts = [{"start_s": bounds[k], "tokens": read_json(workdir / f"part{k + 1}.tokens.json")}
+                 for k in range(n)]
+        words, had_confidence, tokens, ranges = segment.merge_parts(parts)
+        segments = {"count": n, "bounds_s": bounds, "source_token_ranges": ranges}
+        item = self._finish(memo, item, entry, fingerprint, audio, words, had_confidence, tokens, push_roam, segments)
+        shutil.rmtree(workdir, ignore_errors=True)  # kept on failure, for diagnosis
+        return item
 
     def second_read_memo(self, memo: Memo, model: str | None = None, redo: bool = False,
                          only_uncertain: bool = False) -> dict:
@@ -692,7 +897,7 @@ class Worker:
         now = self.clock()
         out = []
         for memo in memos:
-            if self._status(memo) != "pending":
+            if self._status(memo) not in ("pending", "segmenting"):
                 continue
             path = self.cfg.recordings_dir / memo.filename
             try:
@@ -760,7 +965,12 @@ class Worker:
             return summary
 
         summary: dict = {"ok": True, "started": started, "library_readable": True, "memos": len(memos),
-                         "jobs": [], "transcribed": [], "failed": []}
+                         "jobs": [], "transcribed": [], "failed": [], "skipped": []}
+        problem = self.segment_problem()
+        if problem and self.cfg.flag("VOICEMEMOS_SEGMENT_LONG"):
+            log.error("Memos longer than %g min cannot be transcribed: %s",
+                      self.cfg.max_duration_s / 60, problem)
+            summary["warnings"] = [f"long memos cannot be split: {problem}"]
         if not dry_run:
             self.store.write_library(self._snapshot(memos))
             self.store.write_worker({"ok": True, "running": True, "started": started, "library_readable": True,
@@ -770,7 +980,7 @@ class Worker:
             targets = self._resolve_request({"memos": only}, memos)
             for memo in targets[: limit or None]:
                 item = self.transcribe_memo(memo, force=redo, dry_run=dry_run)
-                summary["transcribed" if item["status"] in ("transcribed", "dry_run") else "failed"].append(item)
+                summary[_bucket(item)].append(item)
         else:
             if not dry_run:
                 summary["jobs"] = [{"job_id": j["job_id"], "total": j.get("total"), "failed": j.get("failed")}
@@ -780,13 +990,20 @@ class Worker:
                 if limit and count >= limit:
                     break
                 item = self.transcribe_memo(memo, push_roam=True, dry_run=dry_run)
-                bucket = "transcribed" if item["status"] in ("transcribed", "dry_run") else "failed"
-                summary[bucket].append(item)
+                summary[_bucket(item)].append(item)
                 count += 1
                 if not dry_run:
                     self.store.write_state(self.state)
                     if count % 5 == 0:  # let the MCP tools see progress during long runs
                         self.store.write_library(self._snapshot(memos))
+
+            # Memos that will not be transcribed at all must not disappear silently.
+            for memo in memos:
+                if not self._excluded(memo) and memo.local and self._status(memo) == "too_long":
+                    reason = self.too_long_reason(memo)
+                    log.warning("Not transcribing %s: %s", memo.id, reason)
+                    summary["skipped"].append({"id": memo.id, "short_id": memo.short_id, "title": memo.title,
+                                               "recorded": memo.recorded, "status": "too_long", "error": reason})
 
         if not dry_run:
             self.store.write_state(self.state)

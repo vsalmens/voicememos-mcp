@@ -44,7 +44,14 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_AUTO_TRANSCRIBE": "1",
     "VOICEMEMOS_SINCE": "",
     "VOICEMEMOS_MIN_AGE_S": "60",
+    # Soniox async accepts at most 300 minutes per file; the limit is fixed and cannot be raised
+    # (docs: soniox.com/docs/stt/async/limits-and-quotas). There is no per-file size limit, only
+    # 10 GB and 1,000 files of total storage. 298 leaves a 2-minute margin. Longer memos are cut
+    # into parts of at most MAX_DURATION_MIN - SEGMENT_MARGIN_MIN (ffmpeg, no re-encoding).
     "VOICEMEMOS_MAX_DURATION_MIN": "298",
+    "VOICEMEMOS_SEGMENT_LONG": "1",
+    "VOICEMEMOS_SEGMENT_MARGIN_MIN": "5",
+    "VOICEMEMOS_SEGMENT_SILENCE_WINDOW_MIN": "10",
     "VOICEMEMOS_MAX_ATTEMPTS": "3",
     "VOICEMEMOS_MARKERS": "idea=Idea,task=Task,remember=Remember,question=Question",
     "VOICEMEMOS_MARKER_WAKE": "",
@@ -61,6 +68,7 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_SECOND_READER_MAX_MIN": "60",
     "VOICEMEMOS_SECOND_READER_CHUNK_MIN": "30",
     "VOICEMEMOS_SECOND_READER_MIN_AGREEMENT": "0.1",
+    "VOICEMEMOS_SECOND_READER_MAX_TOTAL_MIN": "600",  # longer memos get no automatic second reading
     "VOICEMEMOS_ROAM_ENABLED": "0",
     "VOICEMEMOS_ROAM_BACKFILL": "0",
     "ROAM_GRAPH": "",
@@ -209,6 +217,11 @@ class Config:
     @property
     def max_duration_s(self) -> float:
         return float(self.get("VOICEMEMOS_MAX_DURATION_MIN")) * 60
+
+    @property
+    def segment_max_s(self) -> float:
+        """Longest part a too long memo is cut into."""
+        return self.max_duration_s - float(self.get("VOICEMEMOS_SEGMENT_MARGIN_MIN")) * 60
 
     @property
     def max_attempts(self) -> int:

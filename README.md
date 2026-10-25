@@ -216,7 +216,8 @@ marked words as certain, and to propose corrections visibly (`word→suggestion 
   (open Voice Memos on the Mac once).
 * [uv](https://docs.astral.sh/uv/)
 * A Soniox API key.
-* Optional: `ffmpeg` for lossless `.qta` handling (otherwise `afconvert` is used).
+* Optional: `ffmpeg` for lossless `.qta` handling (otherwise `afconvert` is used). Needed for
+  memos longer than 298 minutes, which are transcribed in parts.
 
 ## Install
 
@@ -307,6 +308,10 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_SECOND_READER_MODEL` | `gemini-4-argon` | |
 | `VOICEMEMOS_SECOND_READER_MAX_MIN` | `60` | longer recordings are read in parts |
 | `VOICEMEMOS_SECOND_READER_CHUNK_MIN` | `30` | approximate length of a part |
+| `VOICEMEMOS_SECOND_READER_MAX_TOTAL_MIN` | `600` | longer memos get no automatic second reading |
+| `VOICEMEMOS_SEGMENT_LONG` | `1` | split memos longer than the engine accepts (see [Limitations](#limitations)) |
+| `VOICEMEMOS_SEGMENT_MARGIN_MIN` | `5` | parts are at most `VOICEMEMOS_MAX_DURATION_MIN` (298) minus this |
+| `VOICEMEMOS_SEGMENT_SILENCE_WINDOW_MIN` | `10` | move each cut to the longest silence this close to the even split |
 | `VOICEMEMOS_ROAM_ENABLED` | `0` | append new transcripts to Roam daily notes |
 
 Excluded memos are never transcribed, and the MCP tools cannot see them, not even their
@@ -330,7 +335,10 @@ titles.
 Memo status values: `transcribed`, `pending` (will be transcribed automatically),
 `not_transcribed` (outside `VOICEMEMOS_SINCE`; use `voicememos_transcribe`),
 `not_downloaded` (audio still in iCloud; play it once in Voice Memos on the Mac),
-`failed` (after `VOICEMEMOS_MAX_ATTEMPTS` tries), `too_long`, `deleted`.
+`segmenting` (longer than the engine accepts; being transcribed in parts),
+`failed` (after `VOICEMEMOS_MAX_ATTEMPTS` tries; for a memo in parts, of one part),
+`too_long` (long, and splitting is off or ffmpeg is missing; listed under `skipped` in
+`worker.json` and as a warning in `voicememos_status`), `deleted`.
 
 ## Command line
 
@@ -375,7 +383,13 @@ transcripts without new API calls.
   but older or newer versions may differ.
 * Memos whose audio has not been downloaded from iCloud cannot be transcribed until they
   are played once on the Mac.
-* Soniox limits a single file to about 300 minutes.
+* Soniox accepts at most 300 minutes per file. Longer memos are cut with ffmpeg (stream copy,
+  no re-encoding) into the fewest parts of at most 293 minutes, at a silence near the even
+  split, transcribed part by part and merged: time stamps run through the whole recording and
+  the front matter gets `segments` and `segment_bounds_s`. Finished parts are kept in
+  `tmp/<memo id>/` until the memo is done, so a failed part is the only one sent again.
+  Diarization labels hold within one part only (`S1a`, `S1b`; Soniox gives no speaker
+  embeddings to match them across parts); the voiceprint is applied to every part.
 * The Roam Append API request format follows public examples; test with one memo first.
 
 ## Roadmap

@@ -11,7 +11,9 @@
     state.json     per-memo processing state (fingerprint, attempts, outputs)
     worker.json    last worker run: time, result, permission status
     queue/         transcription requests written by the MCP server
-    jobs/          job progress written by the worker
+    jobs/          job progress written by the worker (also one job per part of a memo in parts)
+    tmp/<memo id>/ parts of a memo longer than the engine accepts, and their raw results;
+                   removed when the memo is done, kept after a failure for diagnosis
     logs/          worker logs (launchd)
 
 The split lets the MCP server run without access to the Voice Memos container:
@@ -30,6 +32,7 @@ import uuid
 from pathlib import Path
 
 from . import notation
+from .segment import clock
 
 SCHEMA = "voicememos-mcp/transcript@1"
 JOB_ID = re.compile(r"[0-9a-f]{12}")
@@ -94,6 +97,10 @@ class Store:
     @property
     def jobs_dir(self) -> Path:
         return self.data_dir / "jobs"
+
+    @property
+    def tmp_dir(self) -> Path:
+        return self.data_dir / "tmp"
 
     def ensure_dirs(self) -> None:
         for path in (self.data_dir, self.queue_dir, self.jobs_dir, self.data_dir / "logs", self.output_dir):
@@ -238,6 +245,7 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
     recorded = memo.get("recorded") or ""
     when = recorded.replace("T", " ")[:16]
     duration = memo.get("duration_s") or 0
+    segments = data.get("segments") or {}
     front = [
         "---",
         f"title: {json.dumps(title, ensure_ascii=False)}",
@@ -245,6 +253,11 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
         f"duration_s: {int(duration)}",
         f"memo_id: {memo.get('id')}",
         f"engine: {json.dumps(data.get('engine', {}).get('model', ''))}",
+    ]
+    if segments:  # only for memos transcribed in parts, so other files stay as they were
+        front += [f"segments: {segments['count']}",
+                  f"segment_bounds_s: {json.dumps(segments['bounds_s'])}"]
+    front += [
         f"threshold: {threshold}",
         f"marked_share: {s['marked_share']}",
         f"certainty: {s['certainty']}",
@@ -259,7 +272,14 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
         f"> {notation.READER_NOTE}",
         "",
     ]
+    if segments:
+        cuts = ", ".join(clock(b) for b in segments["bounds_s"][1:-1])
+        front += [f"> Transcribed in {segments['count']} parts (cut at {cuts}), because the speech engine "
+                  "accepts at most 300 minutes per file. Time stamps run through the whole recording.", ""]
     second = next((r for r in data.get("readers", []) if r.get("role") == "second" and not r.get("error")), None)
+    skipped = next((r for r in data.get("readers", []) if r.get("role") == "second" and r.get("skipped")), None)
+    if skipped and not second:
+        front += [f"> Second reader skipped: {skipped['skipped']}.", ""]
     if second:
         agreement = second.get("agreement", {}).get("agreement")
         front += [f"> Second reader: {second.get('model')}, word agreement "
@@ -269,7 +289,8 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
     voice = data.get("voiceprint") or {}
     if speakers:
         parts = ", ".join(f"{v['label']} {100 * v['share']:.0f} %" for v in speakers.values())
-        note = " S-labels hold within this memo only."
+        note = (" S-labels hold within one part only: the letter is the part, and S2a and S2b are not "
+                "necessarily the same person." if segments else " S-labels hold within this memo only.")
         if any(v.get("basis") == "voiceprint" for v in speakers.values()):
             scored = ", ".join(f"{v['label']} {v['voiceprint']:.2f}" for v in speakers.values()
                                if v.get("voiceprint") is not None)

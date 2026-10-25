@@ -114,6 +114,12 @@ def cmd_check(_args) -> int:
     ok &= bool(key)
     print(f"Soniox:         {cfg.get('SONIOX_BASE_URL')} model {cfg.get('SONIOX_MODEL')} languages {cfg.languages}")
     print(f"ffmpeg:         {find_tool('ffmpeg') or '(not found; afconvert is used for .qta)'}")
+    if cfg.flag("VOICEMEMOS_SEGMENT_LONG"):
+        split_ok = bool(find_tool("ffmpeg") and find_tool("ffprobe"))
+        print(f"long memos:     {'split into parts of at most %g min' % (cfg.segment_max_s / 60) if split_ok else 'CANNOT BE SPLIT: ffmpeg/ffprobe missing'}")
+        ok &= split_ok
+    else:
+        print(f"long memos:     not split (VOICEMEMOS_SEGMENT_LONG=0); over {cfg.max_duration_s / 60:g} min = too_long")
     reader = cfg.get("VOICEMEMOS_SECOND_READER")
     gemini_key = cfg.secret("GEMINI_API_KEY")
     print(f"second reader:  {reader or 'off'} ({cfg.get('VOICEMEMOS_SECOND_READER_MODEL')}), "

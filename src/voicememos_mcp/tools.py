@@ -142,6 +142,10 @@ class Tools:
                     warnings.append(f"Last worker run was {age_h:.0f} h ago; the launchd job may not be running.")
             except (TypeError, ValueError):
                 pass
+        warnings += list(worker.get("warnings") or [])
+        if worker.get("skipped"):
+            warnings.append(f"{len(worker['skipped'])} memo(s) will not be transcribed: "
+                            + "; ".join(f"{i['short_id']}: {i['error']}" for i in worker["skipped"][:5]))
         output_readable = self._output_readable()
         if output_readable is False:
             warnings.append(self._permission_hint())
