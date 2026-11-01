@@ -39,6 +39,82 @@ def test_first_run_transcribes_eligible_memos_only(cfg, fake):
     assert worker["transcribed_count"] == 2 and worker["library_readable"]
 
 
+def test_imported_files_are_transcribed_like_memos(cfg, fake):
+    import os
+
+    folder = cfg.import_dir
+    folder.mkdir(parents=True)
+    audio = folder / "GMT20261031-102304_Recording.m4a"
+    audio.write_bytes(b"\0" * 64)
+    old = time.time() - 3600
+    os.utime(audio, (old, old))
+    (folder / (audio.name + ".json")).write_text(json.dumps(
+        {"title": "Alhovuori meeting", "recorded": "2026-10-31T12:23:04+02:00", "duration_s": 120}))
+
+    summary = run(cfg, fake)
+    assert sorted(i["title"] for i in summary["transcribed"]) == ["Alhovuori meeting", "Car notes", "Morning walk"]
+    library = json.loads((cfg.data_dir / "library.json").read_text())
+    item = next(m for m in library["memos"] if m["title"] == "Alhovuori meeting")
+    assert item["status"] == "transcribed" and item["folder"] == "Imported" and item["path"] == str(audio)
+    assert library["import_dir"] == str(folder)
+    md = next(cfg.output_dir.rglob("*alhovuori-meeting_*.md"))
+    assert md.name.startswith("2026-10-31_1223_") and "Hello world (?)." in md.read_text()
+
+    run(cfg, fake)
+    assert len(fake.calls) == 3  # not transcribed again
+
+    audio.unlink()
+    run(cfg, fake)
+    library = json.loads((cfg.data_dir / "library.json").read_text())
+    assert all(m["title"] != "Alhovuori meeting" for m in library["memos"])  # file gone, memo gone
+
+
+def test_imports_are_not_pushed_to_roam(cfg, fake, monkeypatch):
+    cfg.raw.update({"VOICEMEMOS_ROAM_ENABLED": "1", "ROAM_GRAPH": "example-graph"})
+    monkeypatch.setenv("ROAM_API_TOKEN", "test-token")
+    folder = cfg.import_dir
+    folder.mkdir(parents=True)
+    audio = folder / "2026-10-31_1223 Meeting.m4a"
+    audio.write_bytes(b"\0" * 64)
+    import os
+
+    old = time.time() - 3600
+    os.utime(audio, (old, old))
+    sent = []
+
+    class Session:
+        def post(self, url, json=None, headers=None, timeout=None):
+            sent.append(json["append-data"][0]["string"])
+
+            class R:
+                ok = True
+                status_code = 200
+                text = ""
+            return R()
+
+    summary = Worker(cfg, transcriber=fake, roam_session=Session()).run()
+    assert any("Meeting" in i["title"] for i in summary["transcribed"])
+    assert len(sent) == 2 and not any("Meeting" in s for s in sent)
+
+
+def test_import_command_copies_file_and_sidecar(cfg, tmp_path, monkeypatch, capsys):
+    from voicememos_mcp import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "probe_duration", lambda p: 42.0)
+    src = tmp_path / "GMT20261031-102304_Recording.m4a"
+    src.write_bytes(b"\0" * 16)
+    assert cli.main(["import", str(src), "--title", "Alhovuori meeting"]) == 0
+    assert (cfg.import_dir / src.name).exists() and src.exists()
+    meta = json.loads((cfg.import_dir / (src.name + ".json")).read_text())
+    assert meta == {"title": "Alhovuori meeting", "duration_s": 42.0}
+    out = capsys.readouterr().out
+    assert "Alhovuori meeting" in out and "0:42" in out and "next run" in out
+    assert cli.main(["import", str(src)]) == 2  # already imported
+    assert cli.main(["import", str(tmp_path / "notes.txt")]) == 2
+    assert cli.main(["import", str(src), "--replace", "--recorded", "yesterday"]) == 2
+
+
 def test_second_run_skips_done_memos(cfg, fake):
     run(cfg, fake)
     run(cfg, fake)

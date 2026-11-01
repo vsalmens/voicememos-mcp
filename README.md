@@ -120,6 +120,24 @@ The voiceprint is biometric data. It is stored only in `DATA_DIR/voiceprint.json
 600), never in transcripts, and the MCP tools report only a summary. Delete that file to
 remove it.
 
+## Recordings from elsewhere
+
+A Zoom recording, a phone call or a file from a dictaphone is not a Voice Memo, but it can go
+through the same pipeline:
+
+```bash
+voicememos-mcp import ~/Downloads/GMT20261031-102304_Recording.m4a --title "Board meeting"
+```
+
+The file is copied into the import folder (`VOICEMEMOS_IMPORT_DIR`, default
+`DATA_DIR/imports`) with a small JSON sidecar (title, time, duration, folder). The worker then
+treats it like a memo: speakers, voiceprint, second reader, library and MCP tools, in the
+folder "Imported". The recording time is parsed from the file name when it carries one
+(Zoom's `GMT20261031-102304` is UTC; `2026-10-31_1223 Title.m4a` is local time), otherwise
+it is the file's modification time; `--recorded` sets it explicitly. Imported recordings are
+not appended to Roam: a two-hour meeting is not a note of the day. Deleting the file removes
+the memo from the library; the transcript stays.
+
 ## Spoken markers
 
 Say a marker word to collect a sentence as an idea, task or question
@@ -297,6 +315,7 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_CONF_THRESHOLD` | `0.70` | words below this are marked |
 | `VOICEMEMOS_OUTPUT_DIR` | `~/Library/Application Support/voicememos-mcp/transcripts` | outside Documents on purpose, see [Where transcripts live](#where-transcripts-live) |
 | `VOICEMEMOS_SINCE` | | only auto-transcribe memos from this date on |
+| `VOICEMEMOS_IMPORT_DIR` | `DATA_DIR/imports` | recordings from elsewhere, see [Recordings from elsewhere](#recordings-from-elsewhere) |
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
 | `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence; `*` accepts inflected forms (`question*=Question`) |
@@ -346,6 +365,7 @@ Memo status values: `transcribed`, `pending` (will be transcribed automatically)
 voicememos-mcp check                         # paths, permissions, keys
 voicememos-mcp sync --dry-run --limit 1      # one memo, print only, save nothing
 voicememos-mcp sync --memo 1a2b3c4d --redo   # transcribe one memo again
+voicememos-mcp import meeting.m4a --title "Board meeting"   # a recording from elsewhere, transcribed like a memo
 voicememos-mcp transcribe-file memo.m4a --threshold 0.6 --threshold 0.8   # calibration
 voicememos-mcp second-read --since 2026-01-01 --limit 20   # add the second reader
 voicememos-mcp report                        # compare readers per language

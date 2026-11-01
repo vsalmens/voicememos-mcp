@@ -2,7 +2,7 @@
 
 One run (``voicememos-mcp sync``):
 
-1. read the library database and write a snapshot to ``library.json``,
+1. read the library database and the import folder and write a snapshot to ``library.json``,
 2. process queued transcription requests from the MCP server,
 3. transcribe new memos automatically (if enabled); memos longer than the engine accepts are
    cut into parts, transcribed part by part (resumable) and merged (``segment.py``),
@@ -29,7 +29,7 @@ from typing import Callable
 from . import align, notation, roam, segment
 from .audio import cut_audio, find_tool, prepare_audio
 from .config import Config
-from .library import LibraryError, Memo, is_excluded, read_library
+from .library import LibraryError, Memo, is_excluded, probe_duration, read_imports, read_library
 from .store import Store, now_iso, read_json, write_json_atomic
 
 log = logging.getLogger(__name__)
@@ -134,6 +134,15 @@ class Worker:
         self.state: dict = {}
 
     # ------------------------------------------------------------------ helpers
+    def _audio_path(self, memo: Memo) -> Path:
+        return Path(memo.path) if memo.path else self.cfg.recordings_dir / memo.filename
+
+    def _memos(self) -> list[Memo]:
+        """The Voice Memos library plus the import folder, newest first."""
+        memos = read_library(self.cfg.recordings_dir) + read_imports(self.cfg.import_dir, probe_duration)
+        memos.sort(key=lambda m: m.recorded or "", reverse=True)
+        return memos
+
     @property
     def transcriber(self) -> Transcriber:
         if self._transcriber is None:
@@ -352,7 +361,7 @@ class Worker:
             for memo in memos:
                 if not memo.local or not memo.filename:
                     raise RuntimeError(f"memo {memo.short_id} is not downloaded")
-                samples[memo.id] = self.load_audio(prepare_audio(self.cfg.recordings_dir / memo.filename, Path(tmp)))
+                samples[memo.id] = self.load_audio(prepare_audio(self._audio_path(memo), Path(tmp)))
                 entry = self.state.get(memo.id, {})
                 data = self.store.load_transcript(entry["json"]) if entry.get("ok") else None
                 if data and data.get("speakers"):
@@ -390,7 +399,7 @@ class Worker:
         if not memo.local or not memo.filename:
             raise RuntimeError(f"memo {memo.short_id} is not downloaded")
         with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
-            samples = self.load_audio(prepare_audio(self.cfg.recordings_dir / memo.filename, Path(tmp)))
+            samples = self.load_audio(prepare_audio(self._audio_path(memo), Path(tmp)))
             voice = other_voice(name, samples, transcript.get("words", []), speaker, self.embedder())
         voice.update(memo_id=memo.id, speaker=speaker)
         others = [o for o in data.get("others", []) if (o.get("memo_id"), o.get("speaker")) != (memo.id, speaker)]
@@ -426,7 +435,7 @@ class Worker:
                 return {**item, "status": "failed", "error": "transcript file missing"}
             words = data.get("words", [])
             with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
-                audio = prepare_audio(self.cfg.recordings_dir / memo.filename, Path(tmp))
+                audio = prepare_audio(self._audio_path(memo), Path(tmp))
                 if data.get("segments"):
                     speakers, summary = self._identify_parts(audio, words, data["segments"]["bounds_s"])
                 else:
@@ -496,6 +505,7 @@ class Worker:
                 item["error"] = self.too_long_reason(memo)
             items.append(item)
         return {"updated": now_iso(), "recordings_dir": str(self.cfg.recordings_dir),
+                "import_dir": str(self.cfg.import_dir),
                 "excluded_count": excluded, "memos": items}
 
     # ------------------------------------------------------------------ one memo
@@ -510,7 +520,7 @@ class Worker:
         if not memo.local or not memo.filename:
             return {**item, "status": "not_downloaded",
                     "error": "audio is still in iCloud; play the memo once in Voice Memos on this Mac"}
-        path = self.cfg.recordings_dir / memo.filename
+        path = self._audio_path(memo)
         fingerprint = _fingerprint(path)
         entry = self.state.get(memo.id, {})
         if not force and entry.get("ok") and entry.get("fp") == fingerprint:
@@ -700,7 +710,7 @@ class Worker:
             if reader is None:
                 return {**item, "status": "failed", "error": "no second reader configured"}
             with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
-                audio = prepare_audio(self.cfg.recordings_dir / memo.filename, Path(tmp))
+                audio = prepare_audio(self._audio_path(memo), Path(tmp))
                 words, record = self._apply_second_reader(reader, audio, memo, data.get("words", []),
                                                           only_uncertain)
         except Exception as exc:  # noqa: BLE001
@@ -899,7 +909,7 @@ class Worker:
         for memo in memos:
             if self._status(memo) not in ("pending", "segmenting"):
                 continue
-            path = self.cfg.recordings_dir / memo.filename
+            path = self._audio_path(memo)
             try:
                 if now - path.stat().st_mtime < self.cfg.min_age_s:
                     continue  # iCloud may still be writing the file
@@ -923,7 +933,7 @@ class Worker:
         try:
             with single_instance(self.store.data_dir / "worker.lock"):
                 self.state = self.store.read_state()
-                memos = read_library(self.cfg.recordings_dir)
+                memos = self._memos()
                 request = {"memos": only or [], "since": since, "until": until, "all": not (only or since or until)}
                 targets = [m for m in self._resolve_request(request, memos) if self.state.get(m.id, {}).get("ok")]
                 items = []
@@ -956,7 +966,7 @@ class Worker:
     def _run(self, started: str, dry_run: bool, limit: int | None, only: list[str] | None, redo: bool) -> dict:
         self.state = self.store.read_state()
         try:
-            memos = read_library(self.cfg.recordings_dir)
+            memos = self._memos()
         except LibraryError as exc:
             summary = {"ok": False, "started": started, "finished": now_iso(), "error": str(exc),
                        "library_readable": False}
@@ -989,7 +999,8 @@ class Worker:
             for memo in self.auto_candidates(memos):
                 if limit and count >= limit:
                     break
-                item = self.transcribe_memo(memo, push_roam=True, dry_run=dry_run)
+                # An imported recording (a meeting, say) is not a note of the day: no Roam.
+                item = self.transcribe_memo(memo, push_roam=not memo.imported, dry_run=dry_run)
                 summary[_bucket(item)].append(item)
                 count += 1
                 if not dry_run:

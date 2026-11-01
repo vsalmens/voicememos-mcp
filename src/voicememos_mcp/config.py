@@ -30,6 +30,7 @@ RECORDINGS_DIR_CANDIDATES = (
 
 DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_RECORDINGS_DIR": "",
+    "VOICEMEMOS_IMPORT_DIR": "",  # default DATA_DIR/imports
     "VOICEMEMOS_DATA_DIR": "~/Library/Application Support/voicememos-mcp",
     "VOICEMEMOS_OUTPUT_DIR": "~/Library/Application Support/voicememos-mcp/transcripts",
     "VOICEMEMOS_LANGUAGES": "en",
@@ -155,6 +156,12 @@ class Config:
             except PermissionError:
                 return path
         return Path(RECORDINGS_DIR_CANDIDATES[0]).expanduser()
+
+    @property
+    def import_dir(self) -> Path:
+        """Recordings from elsewhere (``voicememos-mcp import``), transcribed like memos."""
+        explicit = self.get("VOICEMEMOS_IMPORT_DIR")
+        return Path(_expand(explicit)) if explicit else self.data_dir / "imports"
 
     # ---- transcription
     @property

@@ -14,21 +14,32 @@ Notes on the schema (observed on macOS 26):
 * ``ZFOLDER`` points to ``ZFOLDER.Z_PK``; the folder name is ``ZENCRYPTEDNAME``.
 * ``ZDATE`` is seconds since 2001-01-01 UTC (Core Data reference date).
 * New recordings are stored as ``.qta`` (QuickTime audio), older ones as ``.m4a``.
+
+Recordings made elsewhere (Zoom, a dictaphone, a phone call) can be copied into the
+import folder (``voicememos-mcp import``); ``read_imports`` turns them into memos
+that the worker treats exactly like memos from the library.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import re
 import shutil
 import sqlite3
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable
 
 APPLE_EPOCH = dt.datetime(2001, 1, 1, tzinfo=dt.timezone.utc)
 AUDIO_EXTENSIONS = {".m4a", ".qta", ".caf", ".mov", ".mp4", ".aac", ".wav", ".mp3", ".aiff"}
 FILENAME_TIMESTAMP = re.compile(r"(\d{8})[ _](\d{6})")
+ZOOM_TIMESTAMP = re.compile(r"GMT(\d{8})-(\d{6})")  # Zoom: GMT20261031-102304_Recording.m4a, UTC
+ISO_TIMESTAMP = re.compile(r"(\d{4}-\d{2}-\d{2})[ _T](\d{2})[.:_-]?(\d{2})")  # 2026-10-31_1223 Title.m4a
+IMPORT_FOLDER = "Imported"
+IMPORT_SIDECAR_KEYS = ("title", "recorded", "duration_s", "folder")
 
 TITLE_COLUMNS = ("ZENCRYPTEDTITLE", "ZCUSTOMLABELFORSORTING", "ZCUSTOMLABEL")
 
@@ -47,10 +58,15 @@ class Memo:
     local: bool  # audio file present on this Mac
     deleted: bool  # in "Recently Deleted"
     folder: str | None
+    path: str | None = None  # full path of an imported file; None for a memo in the library
 
     @property
     def short_id(self) -> str:
         return self.id.replace("-", "")[:8].lower()
+
+    @property
+    def imported(self) -> bool:
+        return self.path is not None
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -164,6 +180,101 @@ def read_library(recordings_dir: Path) -> list[Memo]:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    memos.sort(key=lambda m: m.recorded or "", reverse=True)
+    return memos
+
+
+def import_id(name: str) -> str:
+    """Stable id of an imported file, derived from its name: the transcript keeps pointing at it
+    when the folder moves. 32 hex digits, so ``short_id`` works like a memo's."""
+    return hashlib.sha1(f"import:{name}".encode()).hexdigest()[:32]
+
+
+def timestamp_from_import_name(name: str) -> dt.datetime | None:
+    """Recording time from the names other apps give their files: Zoom's ``GMT…`` (UTC),
+    ``YYYY-MM-DD_HHMM`` (local) or the Voice Memos pattern (local)."""
+    match = ZOOM_TIMESTAMP.search(name)
+    if match:
+        try:
+            return dt.datetime.strptime(match.group(1) + match.group(2), "%Y%m%d%H%M%S").replace(
+                tzinfo=dt.timezone.utc).astimezone()
+        except ValueError:
+            return None
+    match = ISO_TIMESTAMP.search(name)
+    if match:
+        try:
+            return dt.datetime.strptime(match.group(1) + match.group(2) + match.group(3), "%Y-%m-%d%H%M").astimezone()
+        except ValueError:
+            return None
+    return timestamp_from_filename(name)
+
+
+def probe_duration(path: Path) -> float | None:
+    """Duration in seconds via ffprobe, or None when it cannot be read."""
+    from .segment import SegmentError, probe
+
+    try:
+        _codec, duration = probe(path)
+    except SegmentError:
+        return None
+    return duration if duration == duration else None  # NaN when ffprobe gave no duration
+
+
+def read_import_sidecar(path: Path) -> dict:
+    """Metadata of an imported file from ``<name>.json`` next to it; {} when absent or broken."""
+    sidecar = path.with_name(path.name + ".json")
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if k in IMPORT_SIDECAR_KEYS} if isinstance(data, dict) else {}
+
+
+def read_imports(import_dir: Path, probe: Callable[[Path], float | None] | None = None) -> list[Memo]:
+    """Memos for the audio files in the import folder, newest first; [] when the folder is missing.
+
+    Title, time, duration and folder come from the sidecar when it has them; otherwise the title
+    is the file name, the time is parsed from the name or taken from the file's modification
+    time, the duration is probed (``probe``) and the folder is "Imported". Imported memos are
+    always local and never deleted; removing the file removes the memo.
+    """
+    try:
+        candidates = sorted(import_dir.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    memos: list[Memo] = []
+    for path in candidates:
+        if path.name.startswith(".") or path.suffix.lower() not in AUDIO_EXTENSIONS or not path.is_file():
+            continue
+        meta = read_import_sidecar(path)
+        recorded = None
+        if meta.get("recorded"):
+            try:
+                when = dt.datetime.fromisoformat(str(meta["recorded"]))
+                recorded = (when if when.tzinfo else when.astimezone()).isoformat(timespec="seconds")
+            except ValueError:
+                recorded = None
+        if recorded is None:
+            when = timestamp_from_import_name(path.name) or dt.datetime.fromtimestamp(
+                path.stat().st_mtime).astimezone()
+            recorded = when.isoformat(timespec="seconds")
+        duration = meta.get("duration_s")
+        if duration is None and probe is not None:
+            duration = probe(path)
+        title = str(meta.get("title") or path.stem).strip()
+        memos.append(
+            Memo(
+                id=import_id(path.name),
+                title=title or None,
+                recorded=recorded,
+                duration_s=float(duration) if duration else None,
+                filename=path.name,
+                local=True,
+                deleted=False,
+                folder=str(meta.get("folder") or IMPORT_FOLDER),
+                path=str(path),
+            )
+        )
     memos.sort(key=lambda m: m.recorded or "", reverse=True)
     return memos
 

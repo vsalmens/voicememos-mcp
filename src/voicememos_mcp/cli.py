@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import logging
 import os
 import platform
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -15,7 +17,7 @@ from xml.sax.saxutils import escape
 from . import __version__, notation
 from .audio import find_tool, prepare_audio
 from .config import KEYCHAIN_SERVICE, load_config
-from .library import LibraryError, is_excluded, read_library
+from .library import AUDIO_EXTENSIONS, LibraryError, is_excluded, probe_duration, read_imports, read_library
 
 
 def cmd_serve(_args) -> int:
@@ -68,6 +70,71 @@ def cmd_second_read(args) -> int:
     return 0
 
 
+def cmd_import(args) -> int:
+    """Copy (or move) recordings made elsewhere into the import folder, with a metadata sidecar.
+
+    The worker then transcribes them like memos: speakers, voiceprint, second reader, and the
+    MCP tools list them in the folder "Imported". Nothing is sent from here."""
+    cfg = load_config()
+    files = [Path(f).expanduser() for f in args.files]
+    if args.recorded and len(files) > 1:
+        print("error: --recorded applies to one file; import the files one by one", file=sys.stderr)
+        return 2
+    if args.recorded:
+        try:
+            dt.datetime.fromisoformat(args.recorded)
+        except ValueError:
+            print(f"error: --recorded must be ISO 8601 (2026-10-31T12:23:04+02:00), got {args.recorded!r}",
+                  file=sys.stderr)
+            return 2
+    target = cfg.import_dir
+    for src in files:
+        if not src.is_file():
+            print(f"error: {src} is not a file", file=sys.stderr)
+            return 2
+        if src.suffix.lower() not in AUDIO_EXTENSIONS:
+            print(f"error: {src.name}: unsupported format (expected one of {', '.join(sorted(AUDIO_EXTENSIONS))})",
+                  file=sys.stderr)
+            return 2
+        if (target / src.name).exists() and not args.replace:
+            print(f"error: {src.name} is already in {target} (use --replace to transcribe it again)", file=sys.stderr)
+            return 2
+    target.mkdir(parents=True, exist_ok=True)
+    names = []
+    for k, src in enumerate(files, start=1):
+        meta: dict = {}
+        title = args.title
+        if title and len(files) > 1:
+            title = f"{title} ({k}/{len(files)})"
+        if title:
+            meta["title"] = title
+        if args.recorded:
+            meta["recorded"] = args.recorded
+        if args.folder:
+            meta["folder"] = args.folder
+        duration = probe_duration(src)
+        if duration:
+            meta["duration_s"] = round(duration, 3)
+        dest = target / src.name
+        if args.move:
+            shutil.move(str(src), dest)
+        else:
+            shutil.copy2(src, dest)
+        (target / (src.name + ".json")).write_text(json.dumps(meta, ensure_ascii=False, indent=1) + "\n",
+                                                   encoding="utf-8")
+        names.append(src.name)
+    for memo in read_imports(target):
+        if memo.filename in names:
+            duration = f"{int(memo.duration_s // 60)}:{int(memo.duration_s % 60):02d}" if memo.duration_s else "?:??"
+            print(f"{memo.short_id}  {memo.recorded}  {duration:>8}  {memo.title}")
+    if cfg.get("VOICEMEMOS_WORKER") == "launchd":
+        print(f"The worker transcribes them on its next run; to start it now:\n"
+              f"  launchctl kickstart -k gui/$(id -u)/{cfg.get('VOICEMEMOS_LAUNCHD_LABEL')}")
+    else:
+        print("The worker transcribes them on its next run (voicememos-mcp sync).")
+    return 0
+
+
 def cmd_report(args) -> int:
     from .report import build_report, write_report
     from .store import Store
@@ -107,6 +174,8 @@ def cmd_check(_args) -> int:
     except LibraryError as exc:
         ok = False
         print(f"  NOT READABLE: {exc}")
+    imported = read_imports(cfg.import_dir)
+    print(f"imports:        {cfg.import_dir} ({len(imported)} files)")
     print(f"data dir:       {cfg.data_dir}")
     print(f"output dir:     {cfg.output_dir}")
     key = cfg.secret("SONIOX_API_KEY")
@@ -160,7 +229,8 @@ def cmd_transcribe_file(args) -> int:
 def launchd_plist(cfg, program: list[str]) -> str:
     logs = cfg.data_dir / "logs"
     args = "".join(f"<string>{escape(p)}</string>" for p in program)
-    watch = "".join(f"<string>{escape(str(p))}</string>" for p in (cfg.recordings_dir, cfg.data_dir / "queue"))
+    watch = "".join(f"<string>{escape(str(p))}</string>"
+                    for p in (cfg.recordings_dir, cfg.data_dir / "queue", cfg.import_dir))
     path_env = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -230,6 +300,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--until")
     p.add_argument("--samples", type=int, default=15, help="disagreements to sample per language")
 
+    p = sub.add_parser("import", help="copy recordings made elsewhere (Zoom, a recorder) into the import "
+                                      "folder; the worker transcribes them like memos")
+    p.add_argument("files", nargs="+", help="audio files (m4a, mp3, wav, mp4, ...)")
+    p.add_argument("--title", help="title (with several files: numbered 'title (1/3)'); default: file name")
+    p.add_argument("--recorded", help="recording time, ISO 8601; default: parsed from the file name, else "
+                                      "the file's modification time")
+    p.add_argument("--folder", help="folder shown in the library (default 'Imported')")
+    p.add_argument("--move", action="store_true", help="move the files instead of copying them")
+    p.add_argument("--replace", action="store_true", help="replace a file imported earlier")
+
     p = sub.add_parser("transcribe-file", help="transcribe one audio file and print it (nothing saved)")
     p.add_argument("file")
     p.add_argument("--threshold", type=float, action="append", help="render with this threshold (repeatable)")
@@ -246,7 +326,8 @@ def main(argv: list[str] | None = None) -> int:
         logging.getLogger(__name__).warning("Voice Memos is a macOS app; only transcripts can be served here")
     handlers = {None: cmd_serve, "serve": cmd_serve, "sync": cmd_sync, "check": cmd_check,
                 "transcribe-file": cmd_transcribe_file, "launchd-plist": cmd_launchd_plist,
-                "second-read": cmd_second_read, "report": cmd_report, "voiceprint": cmd_voiceprint}
+                "second-read": cmd_second_read, "report": cmd_report, "voiceprint": cmd_voiceprint,
+                "import": cmd_import}
     return handlers[args.command](args)
 
 
