@@ -91,3 +91,13 @@ def test_unsupported_format(tmp_path):
     f.write_bytes(b"0")
     with pytest.raises(RuntimeError):
         prepare_audio(f, Path(tmp_path))
+
+
+def test_skip_keyword_in_title(library):
+    from voicememos_mcp.library import skips_transcription
+
+    memos = {m.title: m for m in read_library(library)}
+    memos["Car notes"].title = "Car notes NoTranscript"
+    assert skips_transcription(memos["Car notes"], "notranscript")
+    assert not skips_transcription(memos["Morning walk"], "notranscript")
+    assert not skips_transcription(memos["Car notes"], "")

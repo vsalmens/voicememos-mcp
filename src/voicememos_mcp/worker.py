@@ -29,7 +29,7 @@ from typing import Callable
 from . import align, notation, roam, segment
 from .audio import cut_audio, find_tool, prepare_audio
 from .config import Config
-from .library import LibraryError, Memo, is_excluded, probe_duration, read_imports, read_library
+from .library import LibraryError, Memo, is_excluded, probe_duration, read_imports, read_library, skips_transcription
 from .store import Store, now_iso, read_json, write_json_atomic
 
 log = logging.getLogger(__name__)
@@ -458,6 +458,12 @@ class Worker:
     def _excluded(self, memo: Memo) -> bool:
         return is_excluded(memo, self.cfg.exclude_title_regex, self.cfg.exclude_folders)
 
+    def _skipped_by_title(self, memo: Memo) -> bool:
+        return skips_transcription(memo, self.cfg.skip_title_keyword)
+
+    def _skip_reason(self) -> str:
+        return f"title contains '{self.cfg.skip_title_keyword}' (VOICEMEMOS_SKIP_TITLE_KEYWORD); rename the memo to transcribe it"
+
     def _status(self, memo: Memo) -> str:
         entry = self.state.get(memo.id, {})
         if memo.deleted:
@@ -466,6 +472,8 @@ class Worker:
             return "transcribed"
         if not memo.local:
             return "not_downloaded"
+        if self._skipped_by_title(memo):
+            return "not_transcribed"
         if entry.get("attempts", 0) >= self.cfg.max_attempts:
             return "failed"
         if self.is_too_long(memo):
@@ -503,6 +511,8 @@ class Worker:
                     item["error"] = failed["error"]
             elif item["status"] == "too_long":
                 item["error"] = self.too_long_reason(memo)
+            elif item["status"] == "not_transcribed" and self._skipped_by_title(memo):
+                item["error"] = self._skip_reason()
             items.append(item)
         return {"updated": now_iso(), "recordings_dir": str(self.cfg.recordings_dir),
                 "import_dir": str(self.cfg.import_dir),
@@ -517,6 +527,8 @@ class Worker:
             return {**item, "status": "excluded", "title": None}
         if memo.deleted:
             return {**item, "status": "deleted"}
+        if self._skipped_by_title(memo):
+            return {**item, "status": "skipped", "error": self._skip_reason()}
         if not memo.local or not memo.filename:
             return {**item, "status": "not_downloaded",
                     "error": "audio is still in iCloud; play the memo once in Voice Memos on this Mac"}

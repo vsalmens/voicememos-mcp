@@ -318,6 +318,7 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_IMPORT_DIR` | `DATA_DIR/imports` | recordings from elsewhere, see [Recordings from elsewhere](#recordings-from-elsewhere) |
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
+| `VOICEMEMOS_SKIP_TITLE_KEYWORD` | `notranscript` | memos with this word in the title are listed but never transcribed |
 | `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence; `*` accepts inflected forms (`question*=Question`) |
 | `VOICEMEMOS_MARKER_WAKE` | | wake word required before a marker word, e.g. `dictate*`; empty = marker word alone |
 | `VOICEMEMOS_MARKER_END` | | end word after the wake word that closes a longer marker, e.g. `end` |
@@ -352,7 +353,8 @@ titles.
 | `voicememos_transcribe_status` | job progress, or recent jobs |
 
 Memo status values: `transcribed`, `pending` (will be transcribed automatically),
-`not_transcribed` (outside `VOICEMEMOS_SINCE`; use `voicememos_transcribe`),
+`not_transcribed` (outside `VOICEMEMOS_SINCE`, use `voicememos_transcribe`; or the title contains
+`VOICEMEMOS_SKIP_TITLE_KEYWORD`, then the memo is not transcribed even on request),
 `not_downloaded` (audio still in iCloud; play it once in Voice Memos on the Mac),
 `segmenting` (longer than the engine accepts; being transcribed in parts),
 `failed` (after `VOICEMEMOS_MAX_ATTEMPTS` tries; for a memo in parts, of one part),

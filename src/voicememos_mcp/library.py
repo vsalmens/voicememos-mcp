@@ -286,3 +286,12 @@ def is_excluded(memo: Memo, title_regex: str, folders: set[str]) -> bool:
     if title_regex and memo.title and re.search(title_regex, memo.title, re.IGNORECASE):
         return True
     return False
+
+
+def skips_transcription(memo: Memo, keyword: str) -> bool:
+    """True when the title contains the configured keyword (case-insensitive).
+
+    Unlike an exclusion, such a memo stays visible in every tool; it is only never transcribed,
+    automatically or on request, until the keyword is removed from the title in Voice Memos.
+    """
+    return bool(keyword and memo.title and keyword.casefold() in memo.title.casefold())

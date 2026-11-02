@@ -266,3 +266,34 @@ def test_worker_marks_itself_running_and_publishes_progress(cfg, monkeypatch):
     assert seen and all(seen)
     final = json.loads((cfg.data_dir / "worker.json").read_text())
     assert "running" not in final and final["transcribed_count"] == 2
+
+
+def test_skip_keyword_in_title_prevents_transcription(cfg, fake, library, monkeypatch):
+    import sqlite3
+
+    db = sqlite3.connect(library / "CloudRecordings.db")
+    db.execute("UPDATE ZCLOUDRECORDING SET ZENCRYPTEDTITLE = 'Car notes notranscript' WHERE ZUNIQUEID LIKE 'BBBB2222%'")
+    db.commit()
+    db.close()
+
+    summary = run(cfg, fake)
+    assert [i["title"] for i in summary["transcribed"]] == ["Morning walk"]
+    lib = json.loads((cfg.data_dir / "library.json").read_text())
+    car = next(m for m in lib["memos"] if m["title"] == "Car notes notranscript")
+    assert car["status"] == "not_transcribed" and "notranscript" in car["error"]
+
+    tools = Tools(cfg)
+    assert tools.list_memos(title="car")["total"] == 1  # still visible, unlike an exclusion
+    job = tools.transcribe(memos=["bbbb2222"])
+    run(cfg, fake)
+    status = tools.transcribe_status(job["job_id"])
+    assert status["items"][0]["status"] == "skipped" and "rename" in status["items"][0]["error"]
+    assert all("BBBB2222" not in c for c in fake.calls)
+
+    # Renaming the memo makes it pending again.
+    db = sqlite3.connect(library / "CloudRecordings.db")
+    db.execute("UPDATE ZCLOUDRECORDING SET ZENCRYPTEDTITLE = 'Car notes' WHERE ZUNIQUEID LIKE 'BBBB2222%'")
+    db.commit()
+    db.close()
+    summary = run(cfg, fake)
+    assert [i["title"] for i in summary["transcribed"]] == ["Car notes"]

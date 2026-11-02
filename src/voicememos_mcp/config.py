@@ -42,6 +42,7 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_TIMESTAMP_EVERY_S": "60",
     "VOICEMEMOS_EXCLUDE_TITLE_REGEX": "",
     "VOICEMEMOS_EXCLUDE_FOLDERS": "",
+    "VOICEMEMOS_SKIP_TITLE_KEYWORD": "notranscript",  # memos with this in the title are listed but not transcribed
     "VOICEMEMOS_AUTO_TRANSCRIBE": "1",
     "VOICEMEMOS_SINCE": "",
     "VOICEMEMOS_MIN_AGE_S": "60",
@@ -212,6 +213,10 @@ class Config:
     @property
     def exclude_folders(self) -> set[str]:
         return {name.casefold() for name in _split_list(self.get("VOICEMEMOS_EXCLUDE_FOLDERS"))}
+
+    @property
+    def skip_title_keyword(self) -> str:
+        return self.get("VOICEMEMOS_SKIP_TITLE_KEYWORD").strip()
 
     @property
     def since(self) -> str:

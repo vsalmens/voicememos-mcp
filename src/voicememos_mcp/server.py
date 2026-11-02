@@ -60,7 +60,8 @@ def build_server(tools: Tools | None = None):
             until: only memos recorded on or before this date (YYYY-MM-DD).
             title: case-insensitive substring of the title.
             status: transcribed, pending, segmenting (longer than the engine accepts: being
-                transcribed in parts), not_transcribed, not_downloaded, failed or too_long (long and
+                transcribed in parts), not_transcribed (outside VOICEMEMOS_SINCE, or the title contains the
+                skip keyword, default 'notranscript'), not_downloaded, failed or too_long (long and
                 cannot be split: splitting off or ffmpeg missing).
         """
         return call(tools.list_memos, limit, offset, since, until, title, status)
