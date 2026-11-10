@@ -58,7 +58,7 @@ def _summary(memo: dict) -> dict:
 class Tools:
     def __init__(self, cfg: Config, store: Store | None = None):
         self.cfg = cfg
-        self.store = store or Store(cfg.data_dir, cfg.output_dir)
+        self.store = store or Store(cfg.data_dir, cfg.output_dir, cfg.folder_dirs)
         self.store.stamp_every_s = cfg.timestamp_every_s
 
     # ------------------------------------------------------------------ helpers

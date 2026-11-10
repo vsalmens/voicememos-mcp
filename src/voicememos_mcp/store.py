@@ -64,9 +64,12 @@ def slugify(text: str | None, limit: int = 40) -> str:
 
 
 class Store:
-    def __init__(self, data_dir: Path, output_dir: Path):
+    def __init__(self, data_dir: Path, output_dir: Path, folder_dirs: dict[str, Path] | None = None):
         self.data_dir = data_dir
         self.output_dir = output_dir
+        # Transcripts of some folders live apart (a Plaud recorder's, say): folder name -> directory.
+        # Their paths are kept absolute in the state; paths under output_dir stay relative as before.
+        self.folder_dirs = {name.casefold(): path for name, path in (folder_dirs or {}).items()}
         self.stamp_every_s = 0  # paragraph time stamps in the Markdown files (set from config)
 
     # ---- paths
@@ -103,7 +106,8 @@ class Store:
         return self.data_dir / "tmp"
 
     def ensure_dirs(self) -> None:
-        for path in (self.data_dir, self.queue_dir, self.jobs_dir, self.data_dir / "logs", self.output_dir):
+        for path in (self.data_dir, self.queue_dir, self.jobs_dir, self.data_dir / "logs", self.output_dir,
+                     *self.folder_dirs.values()):
             path.mkdir(parents=True, exist_ok=True)
 
     # ---- library / state / worker
@@ -126,12 +130,41 @@ class Store:
         write_json_atomic(self.worker_path, data)
 
     # ---- transcripts
+    def root_for(self, memo: dict) -> Path:
+        return self.folder_dirs.get(str(memo.get("folder") or "").casefold(), self.output_dir)
+
+    def _stored(self, path: Path) -> str:
+        """A transcript path as the state keeps it: relative under output_dir, absolute elsewhere."""
+        return str(path.relative_to(self.output_dir)) if self.output_dir in path.parents else str(path)
+
+    def _resolve(self, stored: str) -> Path | None:
+        """The file behind a stored path, or None when it is outside every transcript directory."""
+        path = (self.output_dir / stored).resolve()  # an absolute stored path replaces output_dir
+        roots = [self.output_dir.resolve(), *(d.resolve() for d in self.folder_dirs.values())]
+        return path if any(root in path.parents for root in roots) else None
+
+    def relocate(self, memo: dict, entry: dict) -> bool:
+        """Move a memo's transcript pair to the directory its folder now belongs to (the setting
+        changed, or the transcript was written before the folder had a directory of its own).
+        Updates the paths in ``entry``; True when something moved."""
+        current = self._resolve(entry.get("json") or "")
+        root = self.root_for(memo).resolve()
+        if current is None or root in current.parents or not current.exists():
+            return False
+        target = self.root_for(memo) / current.parent.name / current.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for suffix in (".json", ".md"):
+            if current.with_suffix(suffix).exists():
+                os.replace(current.with_suffix(suffix), target.with_suffix(suffix))
+        entry["json"], entry["markdown"] = self._stored(target), self._stored(target.with_suffix(".md"))
+        return True
+
     def transcript_base(self, memo: dict) -> Path:
         recorded = memo.get("recorded")
         when = dt.datetime.fromisoformat(recorded) if recorded else dt.datetime.now().astimezone()
         short = memo["id"].replace("-", "")[:8].lower()
         name = f"{when:%Y-%m-%d_%H%M}_{slugify(memo.get('title'))}_{short}"
-        return self.output_dir / f"{when:%Y}" / name
+        return self.root_for(memo) / f"{when:%Y}" / name
 
     def write_transcript(self, memo: dict, words: list[dict], engine: dict, had_confidence: bool,
                          threshold: float, run_min: int, pause_ms: int, markers,
@@ -168,8 +201,8 @@ class Store:
         write_json_atomic(json_path, data)
         md_path.write_text(render_markdown(data, threshold, run_min, pause_ms, self.stamp_every_s), encoding="utf-8")
         return {
-            "json": str(json_path.relative_to(self.output_dir)),
-            "markdown": str(md_path.relative_to(self.output_dir)),
+            "json": self._stored(json_path),
+            "markdown": self._stored(md_path),
             "stats": data["stats"],
             "markers": data["markers"],
         }
@@ -177,8 +210,8 @@ class Store:
     def rewrite_transcript(self, relative_json: str, data: dict, threshold: float, run_min: int,
                            pause_ms: int, markers) -> dict:
         """Re-derive stats, markers and flags from ``data["words"]`` and rewrite both files in place."""
-        json_path = (self.output_dir / relative_json).resolve()
-        if self.output_dir.resolve() not in json_path.parents:
+        json_path = self._resolve(relative_json)
+        if json_path is None:
             raise ValueError("transcript path outside the output directory")
         words = data.get("words", [])
         text = "\n\n".join(notation.render_blocks(words, threshold, run_min, pause_ms, data.get("speakers")))
@@ -189,14 +222,12 @@ class Store:
         write_json_atomic(json_path, data)
         json_path.with_suffix(".md").write_text(render_markdown(data, threshold, run_min, pause_ms, self.stamp_every_s),
                                                 encoding="utf-8")
-        return {"json": relative_json, "markdown": str(json_path.with_suffix(".md").relative_to(self.output_dir.resolve())),
+        return {"json": relative_json, "markdown": str(Path(relative_json).with_suffix(".md")),
                 "stats": data["stats"], "markers": data["markers"]}
 
     def load_transcript(self, relative_json: str) -> dict | None:
-        path = (self.output_dir / relative_json).resolve()
-        if self.output_dir.resolve() not in path.parents:
-            return None
-        return read_json(path)
+        path = self._resolve(relative_json)
+        return read_json(path) if path is not None else None
 
     # ---- queue / jobs
     def enqueue(self, request: dict) -> str:

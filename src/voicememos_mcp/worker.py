@@ -123,7 +123,7 @@ class Worker:
                  audio_cutter: Callable = cut_audio, plaud_client=None):
         self.cfg = cfg
         self._plaud_client = plaud_client
-        self.store = store or Store(cfg.data_dir, cfg.output_dir)
+        self.store = store or Store(cfg.data_dir, cfg.output_dir, cfg.folder_dirs)
         self.store.stamp_every_s = cfg.timestamp_every_s
         self._transcriber = transcriber
         self._second_reader = second_reader
@@ -1010,6 +1010,12 @@ class Worker:
 
         summary: dict = {"ok": True, "started": started, "library_readable": True, "memos": len(memos),
                          "jobs": [], "transcribed": [], "failed": [], "skipped": []}
+        if not dry_run:
+            moved = sum(self.store.relocate(m.to_dict(), self.state[m.id]) for m in memos
+                        if self.state.get(m.id, {}).get("ok"))
+            if moved:
+                log.info("Moved %d transcript(s) to their folder's own directory", moved)
+                self.store.write_state(self.state)
         if plaud_summary is not None:
             summary["plaud"] = plaud_summary
             if not plaud_summary["ok"]:

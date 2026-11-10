@@ -211,13 +211,36 @@ def test_worker_fetches_and_transcribes_plaud_recordings(tmp_path, library, toke
     assert summary["plaud"] == {"ok": True, "listed": 1, "fetched": 1, "waiting": 0, "failed": []}
     titles = [i["title"] for i in summary["transcribed"]]
     assert "Tiimipalaveri" in titles
-    md = next(cfg.output_dir.rglob("*tiimipalaveri_*.md")).read_text()
+    assert not list(cfg.output_dir.rglob("*tiimipalaveri_*"))  # apart from the dictated memos
+    path = next(cfg.plaud_output_dir.rglob("*tiimipalaveri_*.md"))
+    assert path.parent == cfg.data_dir / "plaud-transcripts" / "2026" and path.with_suffix(".json").exists()
+    md = path.read_text()
     assert '\nfolder: "Plaud"\n' in md.split("---")[1]
+    from voicememos_mcp.tools import Tools
+    tools = Tools(cfg)
+    entry = worker.state[next(k for k, v in worker.state.items() if str(v.get("markdown", "")).endswith(path.name))]
+    assert entry["markdown"] == str(path) and tools.store.load_transcript(entry["json"])["memo"]["folder"] == "Plaud"
+    assert tools.store.load_transcript("/etc/hosts") is None and tools.store.load_transcript("../state.json") is None
+    worker.store.rewrite_transcript(entry["json"], tools.store.load_transcript(entry["json"]), 0.7, 4, 2500, cfg.marker_spec)
+    memo_id = next(k for k, v in worker.state.items() if v is entry)
+    assert "Hello" in tools.read(memo_id)["text"] and path.exists()  # the MCP tools read it where it is
     item = next(m for m in json.loads((cfg.data_dir / "library.json").read_text())["memos"] if m["title"] == "Tiimipalaveri")
     assert item["folder"] == "Plaud" and item["status"] == "transcribed"
 
     calls = len(fake.calls)
     assert worker.run()["plaud"]["fetched"] == 0 and len(fake.calls) == calls
+
+    # a transcript written among the dictated memos (0.7.0) moves to the Plaud folder on the next run
+    old = cfg.output_dir / "2026" / path.name
+    path.rename(old), path.with_suffix(".json").rename(old.with_suffix(".json"))
+    state = json.loads((cfg.data_dir / "state.json").read_text())
+    state[memo_id].update(markdown=f"2026/{old.name}", json=f"2026/{old.with_suffix('.json').name}")
+    (cfg.data_dir / "state.json").write_text(json.dumps(state))
+    worker.run()
+    assert path.exists() and path.with_suffix(".json").exists() and not old.exists() and len(fake.calls) == calls
+    assert json.loads((cfg.data_dir / "state.json").read_text())[memo_id]["markdown"] == str(path)
+    voice = [v["markdown"] for k, v in worker.state.items() if k != memo_id and v.get("ok")]
+    assert voice and all(not m.startswith("/") for m in voice)  # dictated memos stay where they were
 
 
 def test_plaud_failure_is_a_warning_and_voice_memos_still_run(cfg, tmp_path):

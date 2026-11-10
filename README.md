@@ -147,9 +147,10 @@ there. With `VOICEMEMOS_PLAUD=1` the worker fetches new recordings on every run 
 developer API (the one Plaud's own command-line tool uses) into the import folder, as
 `plaud_<id>.mp3` with a sidecar: Plaud's name for the recording as the title, the recording's
 start time, its duration, and the folder "Plaud". From there on it is an imported recording:
-speakers, voiceprint, second reader, no Roam. The transcript's front matter carries
-`folder: "Plaud"`, so a reader of the transcripts can tell an ambient recording from a dictated
-memo.
+speakers, voiceprint, second reader, no Roam. The transcripts are written to a folder of their
+own, `VOICEMEMOS_PLAUD_OUTPUT_DIR` (default `DATA_DIR/plaud-transcripts`, same layout as
+`OUTPUT_DIR`), so hours of meetings do not mix with dictated memos; the MCP tools list and read
+both. The front matter also carries `folder: "Plaud"`.
 
 Setup, once, on the machine that runs the worker:
 
@@ -355,6 +356,7 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_SINCE` | | only auto-transcribe memos from this date on |
 | `VOICEMEMOS_IMPORT_DIR` | `DATA_DIR/imports` | recordings from elsewhere, see [Recordings from elsewhere](#recordings-from-elsewhere) |
 | `VOICEMEMOS_PLAUD` | `0` | `1` = fetch a Plaud recorder's recordings into the import folder, see [Plaud recorder](#plaud-recorder) |
+| `VOICEMEMOS_PLAUD_OUTPUT_DIR` | `DATA_DIR/plaud-transcripts` | where a Plaud recorder's transcripts are written |
 | `VOICEMEMOS_PLAUD_SINCE` | | only recordings from this date on |
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |

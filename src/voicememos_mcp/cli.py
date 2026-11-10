@@ -160,7 +160,7 @@ def cmd_report(args) -> int:
     from .store import Store
 
     cfg = load_config()
-    store = Store(cfg.data_dir, cfg.output_dir)
+    store = Store(cfg.data_dir, cfg.output_dir, cfg.folder_dirs)
     paths = write_report(store, build_report(store, args.since, args.until, args.samples))
     print(paths["markdown"])
     return 0
