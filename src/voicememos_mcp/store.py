@@ -254,6 +254,8 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
         f"memo_id: {memo.get('id')}",
         f"engine: {json.dumps(data.get('engine', {}).get('model', ''))}",
     ]
+    if memo.get("folder"):  # the Voice Memos folder, "Imported", or the recorder ("Plaud")
+        front.append(f"folder: {json.dumps(memo['folder'], ensure_ascii=False)}")
     if segments:  # only for memos transcribed in parts, so other files stay as they were
         front += [f"segments: {segments['count']}",
                   f"segment_bounds_s: {json.dumps(segments['bounds_s'])}"]

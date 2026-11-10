@@ -22,6 +22,7 @@ iPhone ──iCloud──▶ Voice Memos on the Mac
                         │  (Full Disk Access, read-only)
                         ▼
               worker (launchd)  ── audio ──▶ Soniox  (file and transcript deleted after use)
+                        │  ◀── audio ── Plaud cloud (optional, VOICEMEMOS_PLAUD)
                         │
                         ├─▶ OUTPUT_DIR/2026/2026-10-13_2135_title_1a2b3c4d.{md,json}
                         ├─▶ DATA_DIR/library.json, state.json, jobs/
@@ -137,6 +138,43 @@ folder "Imported". The recording time is parsed from the file name when it carri
 it is the file's modification time; `--recorded` sets it explicitly. Imported recordings are
 not appended to Roam: a two-hour meeting is not a note of the day. Deleting the file removes
 the memo from the library; the transcript stays.
+
+### Plaud recorder
+
+A Plaud Note Pro (also Note and NotePin) has no USB file access: recordings go to the phone app
+over Bluetooth or Wi-Fi and on to Plaud's cloud, and the original audio is available only from
+there. With `VOICEMEMOS_PLAUD=1` the worker fetches new recordings on every run through Plaud's
+developer API (the one Plaud's own command-line tool uses) into the import folder, as
+`plaud_<id>.mp3` with a sidecar: Plaud's name for the recording as the title, the recording's
+start time, its duration, and the folder "Plaud". From there on it is an imported recording:
+speakers, voiceprint, second reader, no Roam. The transcript's front matter carries
+`folder: "Plaud"`, so a reader of the transcripts can tell an ambient recording from a dictated
+memo.
+
+Setup, once, on the machine that runs the worker:
+
+```bash
+npm install -g @plaud-ai/cli
+DO_NOT_TRACK=1 plaud login        # opens the browser; tokens go to ~/.plaud/tokens.json
+voicememos-mcp plaud --dry-run    # how many recordings would be fetched
+```
+
+Then set `VOICEMEMOS_PLAUD=1` (and `VOICEMEMOS_PLAUD_SINCE=YYYY-MM-DD`, unless every recording
+of the account should be fetched and transcribed) and run `./install.sh`.
+
+* Only the login file of Plaud's tool is used, not the tool: the worker refreshes the access
+  token itself and writes the file back in the same shape. `DO_NOT_TRACK=1` turns off the
+  usage statistics Plaud's tool otherwise sends (PostHog).
+* Only audio, name, times and duration are read. Plaud's own transcripts and summaries are not.
+* A recording that has not reached the cloud yet has no audio link and is tried again on the
+  next run (every 30 minutes). Syncing the recorder to the phone is still up to the Plaud app.
+* What has been fetched is kept in `DATA_DIR/plaud.json`. Deleting a file from the import folder
+  removes the memo and it is not fetched again; delete its entry in `plaud.json` to get it back.
+* A recording renamed in Plaud later (its AI gives titles after a summary) gets the new title in
+  the library; a transcript already written keeps its title until transcribed again.
+* A failed fetch (no network, login expired) is a warning in `voicememos_status` and in the
+  worker log, and never stops Voice Memos from being transcribed. When the login is refused:
+  `plaud login` again.
 
 ## Spoken markers
 
@@ -316,6 +354,8 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_OUTPUT_DIR` | `~/Library/Application Support/voicememos-mcp/transcripts` | outside Documents on purpose, see [Where transcripts live](#where-transcripts-live) |
 | `VOICEMEMOS_SINCE` | | only auto-transcribe memos from this date on |
 | `VOICEMEMOS_IMPORT_DIR` | `DATA_DIR/imports` | recordings from elsewhere, see [Recordings from elsewhere](#recordings-from-elsewhere) |
+| `VOICEMEMOS_PLAUD` | `0` | `1` = fetch a Plaud recorder's recordings into the import folder, see [Plaud recorder](#plaud-recorder) |
+| `VOICEMEMOS_PLAUD_SINCE` | | only recordings from this date on |
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
 | `VOICEMEMOS_SKIP_TITLE_KEYWORD` | `notranscript` | memos with this word in the title are listed but never transcribed |

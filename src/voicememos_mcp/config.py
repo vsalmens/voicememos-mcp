@@ -31,6 +31,12 @@ RECORDINGS_DIR_CANDIDATES = (
 DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_RECORDINGS_DIR": "",
     "VOICEMEMOS_IMPORT_DIR": "",  # default DATA_DIR/imports
+    # Plaud recorder: fetch new recordings from Plaud's cloud into the import folder (see plaud.py).
+    "VOICEMEMOS_PLAUD": "0",
+    "VOICEMEMOS_PLAUD_SINCE": "",  # YYYY-MM-DD; empty = every recording of the account
+    "VOICEMEMOS_PLAUD_TOKENS": "~/.plaud/tokens.json",  # written by `plaud login` (@plaud-ai/cli)
+    "VOICEMEMOS_PLAUD_API_BASE": "",  # default https://platform.plaud.ai/developer/api
+    "VOICEMEMOS_PLAUD_REGION": "",  # sent as x-pld-region when set; normally not needed
     "VOICEMEMOS_DATA_DIR": "~/Library/Application Support/voicememos-mcp",
     "VOICEMEMOS_OUTPUT_DIR": "~/Library/Application Support/voicememos-mcp/transcripts",
     "VOICEMEMOS_LANGUAGES": "en",
@@ -163,6 +169,11 @@ class Config:
         """Recordings from elsewhere (``voicememos-mcp import``), transcribed like memos."""
         explicit = self.get("VOICEMEMOS_IMPORT_DIR")
         return Path(_expand(explicit)) if explicit else self.data_dir / "imports"
+
+    @property
+    def plaud_tokens_path(self) -> Path:
+        """The login `plaud login` stored (Plaud's own command-line tool)."""
+        return Path(_expand(self.get("VOICEMEMOS_PLAUD_TOKENS")))
 
     # ---- transcription
     @property

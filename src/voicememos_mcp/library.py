@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Callable
 
 APPLE_EPOCH = dt.datetime(2001, 1, 1, tzinfo=dt.timezone.utc)
-AUDIO_EXTENSIONS = {".m4a", ".qta", ".caf", ".mov", ".mp4", ".aac", ".wav", ".mp3", ".aiff"}
+AUDIO_EXTENSIONS = {".m4a", ".qta", ".caf", ".mov", ".mp4", ".aac", ".wav", ".mp3", ".aiff", ".ogg"}
 FILENAME_TIMESTAMP = re.compile(r"(\d{8})[ _](\d{6})")
 ZOOM_TIMESTAMP = re.compile(r"GMT(\d{8})-(\d{6})")  # Zoom: GMT20261031-102304_Recording.m4a, UTC
 ISO_TIMESTAMP = re.compile(r"(\d{4}-\d{2}-\d{2})[ _T](\d{2})[.:_-]?(\d{2})")  # 2026-10-31_1223 Title.m4a

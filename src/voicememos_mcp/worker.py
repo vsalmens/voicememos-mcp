@@ -120,8 +120,9 @@ class Worker:
     def __init__(self, cfg: Config, store: Store | None = None, transcriber: Transcriber | None = None,
                  roam_session=None, clock: Callable[[], float] = time.time,
                  second_reader: SecondReader | None = None, embedder=None, audio_loader=None,
-                 audio_cutter: Callable = cut_audio):
+                 audio_cutter: Callable = cut_audio, plaud_client=None):
         self.cfg = cfg
+        self._plaud_client = plaud_client
         self.store = store or Store(cfg.data_dir, cfg.output_dir)
         self.store.stamp_every_s = cfg.timestamp_every_s
         self._transcriber = transcriber
@@ -975,8 +976,29 @@ class Worker:
         except Busy as exc:
             return {"ok": True, "skipped": str(exc)}
 
+    def fetch_plaud(self) -> dict | None:
+        """New recordings from Plaud's cloud into the import folder (VOICEMEMOS_PLAUD=1). A problem
+        here is reported and never stops the run: the Voice Memos side does not depend on Plaud."""
+        if not self.cfg.flag("VOICEMEMOS_PLAUD"):
+            return None
+        from . import plaud
+
+        try:
+            client = self._plaud_client or plaud.client_from_config(self.cfg)
+            result = plaud.fetch_new(client, self.cfg.import_dir, self.store.data_dir / "plaud.json",
+                                     since=self.cfg.get("VOICEMEMOS_PLAUD_SINCE"))
+        except Exception as exc:  # noqa: BLE001 - network, login, a changed API
+            log.error("Plaud fetch failed: %s", exc)
+            return {"ok": False, "error": str(exc)[:300]}
+        if result["fetched"] or result["failed"]:
+            log.info("Plaud: %d fetched, %d waiting for upload, %d failed",
+                     len(result["fetched"]), len(result["waiting"]), len(result["failed"]))
+        return {"ok": not result["failed"], "listed": result["listed"], "fetched": len(result["fetched"]),
+                "waiting": len(result["waiting"]), "failed": result["failed"]}
+
     def _run(self, started: str, dry_run: bool, limit: int | None, only: list[str] | None, redo: bool) -> dict:
         self.state = self.store.read_state()
+        plaud_summary = None if (dry_run or only) else self.fetch_plaud()
         try:
             memos = self._memos()
         except LibraryError as exc:
@@ -988,11 +1010,16 @@ class Worker:
 
         summary: dict = {"ok": True, "started": started, "library_readable": True, "memos": len(memos),
                          "jobs": [], "transcribed": [], "failed": [], "skipped": []}
+        if plaud_summary is not None:
+            summary["plaud"] = plaud_summary
+            if not plaud_summary["ok"]:
+                summary.setdefault("warnings", []).append(
+                    f"Plaud: {plaud_summary.get('error') or 'some recordings were not fetched'}")
         problem = self.segment_problem()
         if problem and self.cfg.flag("VOICEMEMOS_SEGMENT_LONG"):
             log.error("Memos longer than %g min cannot be transcribed: %s",
                       self.cfg.max_duration_s / 60, problem)
-            summary["warnings"] = [f"long memos cannot be split: {problem}"]
+            summary.setdefault("warnings", []).append(f"long memos cannot be split: {problem}")
         if not dry_run:
             self.store.write_library(self._snapshot(memos))
             self.store.write_worker({"ok": True, "running": True, "started": started, "library_readable": True,

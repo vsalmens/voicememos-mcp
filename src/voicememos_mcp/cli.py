@@ -135,6 +135,26 @@ def cmd_import(args) -> int:
     return 0
 
 
+def cmd_plaud(args) -> int:
+    """Fetch new recordings of a Plaud recorder into the import folder (what the worker does on
+    every run with VOICEMEMOS_PLAUD=1). Prints ids and counts, never titles."""
+    from . import plaud
+
+    cfg = load_config()
+    try:
+        result = plaud.fetch_new(plaud.client_from_config(cfg), cfg.import_dir, cfg.data_dir / "plaud.json",
+                                 since=cfg.get("VOICEMEMOS_PLAUD_SINCE"), limit=args.limit, dry_run=args.dry_run)
+    except plaud.PlaudError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    verb = "would fetch" if args.dry_run else "fetched"
+    print(f"{result['listed']} recordings in the account; {verb} {len(result['fetched'])}, "
+          f"{len(result['waiting'])} not uploaded yet, {len(result['failed'])} failed")
+    for failure in result["failed"]:
+        print(f"  {failure['id']}: {failure['error']}", file=sys.stderr)
+    return 1 if result["failed"] else 0
+
+
 def cmd_report(args) -> int:
     from .report import build_report, write_report
     from .store import Store
@@ -176,6 +196,9 @@ def cmd_check(_args) -> int:
         print(f"  NOT READABLE: {exc}")
     imported = read_imports(cfg.import_dir)
     print(f"imports:        {cfg.import_dir} ({len(imported)} files)")
+    if cfg.flag("VOICEMEMOS_PLAUD"):
+        tokens = cfg.plaud_tokens_path
+        print(f"Plaud:          on, login {'found' if tokens.exists() else 'MISSING: run `plaud login`'} ({tokens})")
     print(f"data dir:       {cfg.data_dir}")
     print(f"output dir:     {cfg.output_dir}")
     key = cfg.secret("SONIOX_API_KEY")
@@ -310,6 +333,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--move", action="store_true", help="move the files instead of copying them")
     p.add_argument("--replace", action="store_true", help="replace a file imported earlier")
 
+    p = sub.add_parser("plaud", help="fetch new recordings of a Plaud recorder from Plaud's cloud into the "
+                                     "import folder (needs `plaud login` from @plaud-ai/cli once)")
+    p.add_argument("--dry-run", action="store_true", help="only count what would be fetched")
+    p.add_argument("--limit", type=int, help="fetch at most this many recordings")
+
     p = sub.add_parser("transcribe-file", help="transcribe one audio file and print it (nothing saved)")
     p.add_argument("file")
     p.add_argument("--threshold", type=float, action="append", help="render with this threshold (repeatable)")
@@ -327,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {None: cmd_serve, "serve": cmd_serve, "sync": cmd_sync, "check": cmd_check,
                 "transcribe-file": cmd_transcribe_file, "launchd-plist": cmd_launchd_plist,
                 "second-read": cmd_second_read, "report": cmd_report, "voiceprint": cmd_voiceprint,
-                "import": cmd_import}
+                "import": cmd_import, "plaud": cmd_plaud}
     return handlers[args.command](args)
 
 
