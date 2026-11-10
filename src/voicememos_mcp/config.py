@@ -61,7 +61,7 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_WORKER": "launchd",
     "VOICEMEMOS_LAUNCHD_LABEL": "local.voicememos-mcp.sync",
     "SONIOX_BASE_URL": "https://api.soniox.com",
-    "SONIOX_MODEL": "stt-async-v5",
+    "SONIOX_MODEL": "stt-async-v6",
     "VOICEMEMOS_DIARIZATION": "1",
     "VOICEMEMOS_VOICEPRINT_NAME": "",
     "VOICEMEMOS_VOICEPRINT_MODEL": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced",

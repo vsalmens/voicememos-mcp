@@ -26,7 +26,7 @@ class SonioxError(RuntimeError):
 
 class Soniox:
     def __init__(self, api_key: str, base_url: str = "https://api.soniox.com",
-                 model: str = "stt-async-v5", session=None, poll_interval: float = 2.0,
+                 model: str = "stt-async-v6", session=None, poll_interval: float = 2.0,
                  poll_timeout: float = 1800.0, retries: int = 3):
         if session is None:
             import requests

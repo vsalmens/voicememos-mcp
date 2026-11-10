@@ -107,13 +107,13 @@ def test_markdown_of_a_memo_in_parts():
     words, had_conf, *_ = segment.merge_parts([{"start_s": 0, "tokens": PART1},
                                                {"start_s": 3700, "tokens": PART2}])
     data = {"memo": {"id": "X", "title": "Long", "recorded": "2026-10-24T13:49:51+03:00", "duration_s": 7400},
-            "engine": {"model": "stt-async-v5"}, "confidence_available": had_conf, "words": words,
+            "engine": {"model": "stt-async-v6"}, "confidence_available": had_conf, "words": words,
             "speakers": segment.speaker_labels(words),
             "segments": {"count": 2, "bounds_s": [0, 3700.0, 7400.0], "source_token_ranges": [[0, 5], [5, 8]]},
             "readers": [{"role": "primary"}, {"role": "second", "skipped": "too long", "error": "skipped: too long"}]}
     md = render_markdown(data, 0.7, stamp_every_s=60)
     front = md.split("---")[1]
-    assert 'engine: "stt-async-v5"' in front
+    assert 'engine: "stt-async-v6"' in front
     assert "segments: 2" in front and "segment_bounds_s: [0, 3700.0, 7400.0]" in front
     assert "Transcribed in 2 parts (cut at 1:01:40)" in md
     assert "S2a and S2b are not necessarily the same person" in md
@@ -182,7 +182,7 @@ def test_long_memo_is_transcribed_in_two_parts(tmp_path, library):
     data = json.loads(next(cfg.output_dir.rglob("*morning-walk_aaaa1111.json")).read_text())
     a, cut, end = data["segments"]["bounds_s"]
     assert a == 0 and 10 <= cut <= 13 and end == 23.0  # in the silence
-    assert data["engine"]["model"] == "stt-async-v5"
+    assert data["engine"]["model"] == "stt-async-v6"
     starts = [w["start_ms"] for w in data["words"]]
     assert len(data["words"]) == 2 * 7 and starts == sorted(starts)
     assert data["words"][7]["start_ms"] == round(cut * 1000)  # part 2 starts at the cut
