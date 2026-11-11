@@ -189,8 +189,16 @@ def test_one_failed_download_does_not_stop_the_rest(tmp_path, tokens):
     result = plaud.fetch_new(client(cloud, tokens), tmp_path / "imports", tmp_path / "plaud.json")
     assert result["fetched"] == ["b2"] and result["failed"][0]["id"] == "a1"
     assert [p.name for p in (tmp_path / "imports").iterdir() if p.suffix != ".json"] == ["plaud_b2.mp3"]
-    cloud.audio["a1"] = MP3  # tried again on the next run
-    assert plaud.fetch_new(client(cloud, tokens), tmp_path / "imports", tmp_path / "plaud.json")["fetched"] == ["a1"]
+    cloud.audio["a1"] = MP3  # tried again, but not on every run: after a pause that grows
+    state = tmp_path / "plaud.json"
+    calls = len(cloud.calls)
+    again = plaud.fetch_new(client(cloud, tokens), tmp_path / "imports", state)
+    assert again["fetched"] == [] and again["failing"] == 1 and len(cloud.calls) - calls <= 2  # only the listing
+    failure = json.loads(state.read_text())["failures"]["a1"]
+    assert failure["count"] == 1 and "empty" in failure["error"]
+    later = plaud.fetch_new(client(cloud, tokens), tmp_path / "imports", state, clock=lambda: time.time() + 400)
+    assert later["fetched"] == ["a1"] and later["failing"] == 0
+    assert json.loads(state.read_text())["failures"] == {}
 
 
 def test_worker_fetches_and_transcribes_plaud_recordings(tmp_path, library, tokens):

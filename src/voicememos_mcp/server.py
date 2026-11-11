@@ -44,7 +44,8 @@ def build_server(tools: Tools | None = None):
 
     @server.tool()
     def voicememos_status() -> dict:
-        """Library size, transcription status counts, worker health and configuration."""
+        """Library size, transcription status counts, worker health (alerts: what needs a person),
+        usage per month (audio minutes and tokens sent to the engines) and configuration."""
         return call(tools.status)
 
     @server.tool()
@@ -61,8 +62,9 @@ def build_server(tools: Tools | None = None):
             title: case-insensitive substring of the title.
             status: transcribed, pending, segmenting (longer than the engine accepts: being
                 transcribed in parts), not_transcribed (outside VOICEMEMOS_SINCE, or the title contains the
-                skip keyword, default 'notranscript'), not_downloaded, failed or too_long (long and
-                cannot be split: splitting off or ffmpeg missing).
+                skip keyword, default 'notranscript'), not_downloaded, failed (several tries failed;
+                tried again once a day), too_long (long and cannot be split: splitting off or ffmpeg
+                missing) or audio_removed (transcribed, the recording itself is gone; still readable).
         """
         return call(tools.list_memos, limit, offset, since, until, title, status)
 

@@ -9,6 +9,7 @@ import logging
 import os
 import platform
 import shutil
+import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -27,11 +28,41 @@ def cmd_serve(_args) -> int:
     return 0
 
 
+def rotate_logs(cfg) -> None:
+    """Set a log that has grown past VOICEMEMOS_LOG_MAX_MB aside as ``<name>.1`` (one generation).
+    launchd opens the log again at every start, so this run writes on into the renamed file and
+    the next one starts a new file."""
+    limit = cfg.log_max_bytes
+    for name in ("worker.log", "worker.err.log"):
+        path = cfg.data_dir / "logs" / name
+        try:
+            if limit and path.stat().st_size > limit:
+                os.replace(path, path.with_name(name + ".1"))
+        except OSError:
+            pass
+
+
+def _did_something(summary: dict) -> bool:
+    return bool(not summary.get("ok") or summary.get("transcribed") or summary.get("failed") or summary.get("jobs")
+                or summary.get("retitled") or (summary.get("plaud") or {}).get("fetched"))
+
+
+def _stop(_signum, _frame):
+    # As an exception, so that `finally` blocks run: what was sent to Soniox is deleted there.
+    raise SystemExit(143)
+
+
 def cmd_sync(args) -> int:
     from .worker import Worker
 
     cfg = load_config()
+    rotate_logs(cfg)
+    signal.signal(signal.SIGTERM, _stop)
     summary = Worker(cfg).run(dry_run=args.dry_run, limit=args.limit, only=args.memo, redo=args.redo)
+    # A timed run that found nothing to do (every minute, with a Plaud recorder) says nothing:
+    # its result is in worker.json, and the log stays readable.
+    if not (_did_something(summary) or args.dry_run or args.memo or args.limit or sys.stdout.isatty()):
+        return 0
     if args.dry_run:
         for item in summary.get("transcribed", []):
             print(f"== {item.get('recorded', '')[:16]} {item.get('title') or ''}")
@@ -140,16 +171,33 @@ def cmd_plaud(args) -> int:
     every run with VOICEMEMOS_PLAUD=1). Prints ids and counts, never titles."""
     from . import plaud
 
+    from .worker import Busy, single_instance
+
     cfg = load_config()
     try:
-        result = plaud.fetch_new(plaud.client_from_config(cfg), cfg.import_dir, cfg.data_dir / "plaud.json",
-                                 since=cfg.get("VOICEMEMOS_PLAUD_SINCE"), limit=args.limit, dry_run=args.dry_run)
+        if args.dry_run:
+            result = plaud.fetch_new(plaud.client_from_config(cfg), cfg.import_dir, cfg.data_dir / "plaud.json",
+                                     since=cfg.get("VOICEMEMOS_PLAUD_SINCE"), limit=args.limit, dry_run=True)
+        else:
+            # The worker fetches too (every minute): two fetches at once would write the same
+            # partial file and lose each other's entries in plaud.json.
+            with single_instance(cfg.data_dir / "worker.lock"):
+                result = plaud.fetch_new(plaud.client_from_config(cfg), cfg.import_dir, cfg.data_dir / "plaud.json",
+                                         since=cfg.get("VOICEMEMOS_PLAUD_SINCE"), limit=args.limit)
+    except Busy:
+        print("error: the worker is running (it fetches Plaud recordings itself); try again in a moment",
+              file=sys.stderr)
+        return 1
     except plaud.PlaudError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if result.get("rate_limited"):
+        print(f"Plaud asked for fewer requests (429); nothing is asked before {result['rate_limited']}")
+        return 1
     verb = "would fetch" if args.dry_run else "fetched"
-    print(f"{result['listed']} recordings in the account; {verb} {len(result['fetched'])}, "
-          f"{len(result['waiting'])} not uploaded yet, {len(result['failed'])} failed")
+    print(f"{result['listed']} recordings listed; {verb} {len(result['fetched'])}, "
+          f"{len(result['waiting'])} not uploaded yet, {len(result['failed'])} failed"
+          + (f", {result['failing']} waiting for another try" if result.get("failing") else ""))
     for failure in result["failed"]:
         print(f"  {failure['id']}: {failure['error']}", file=sys.stderr)
     return 1 if result["failed"] else 0
@@ -194,8 +242,10 @@ def cmd_check(_args) -> int:
     except LibraryError as exc:
         ok = False
         print(f"  NOT READABLE: {exc}")
+        memos = []
     imported = read_imports(cfg.import_dir)
     print(f"imports:        {cfg.import_dir} ({len(imported)} files)")
+    ok &= _check_state(cfg, memos + imported)
     if cfg.flag("VOICEMEMOS_PLAUD"):
         tokens = cfg.plaud_tokens_path
         print(f"Plaud:          on, login {'found' if tokens.exists() else 'MISSING: run `plaud login`'} ({tokens})")
@@ -227,6 +277,39 @@ def cmd_check(_args) -> int:
     else:
         print("Roam:           disabled")
     return 0 if ok else 1
+
+
+def _check_state(cfg, memos) -> bool:
+    """What the next worker run would do, and what has been sent to the engines so far."""
+    from collections import Counter
+
+    from .store import StateError
+    from .worker import Worker, _changed
+
+    worker = Worker(cfg)
+    try:
+        worker._load_state()
+    except StateError as exc:
+        print(f"state:          NOT READABLE: {exc}")
+        return False
+    memos = [m for m in memos if not worker._excluded(m)]
+    counts: Counter = Counter()
+    for memo in memos:
+        status, entry = worker._status(memo), worker.state.get(memo.id, {})
+        again = entry.get("ok") and status != "transcribed" and _changed(entry.get("fp"), worker._fp(memo))
+        counts["changed" if again and status != "failed" else status] += 1
+    print(f"state:          {counts['transcribed']} transcribed, {counts['pending'] + counts['segmenting']} "
+          f"waiting, {counts['changed']} changed since they were transcribed (the next run transcribes "
+          f"them again), {counts['failed']} failed (tried again once a day)")
+    for alert in worker.store.read_worker().get("alerts") or []:
+        print(f"  ALERT {alert.get('kind')}: {alert.get('line')} (since {alert.get('since')})")
+    usage = worker.store.recent_usage()
+    for month, used in usage.items():
+        print(f"usage {month}:  Soniox {used.get('soniox_audio_min', 0):g} min in {used.get('soniox_files', 0):g} "
+              f"files; Gemini {used.get('gemini_tokens', 0):,.0f} tokens in {used.get('gemini_calls', 0):g} calls")
+    if not usage:
+        print("usage:          nothing recorded yet (counted from version 0.8)")
+    return True
 
 
 def cmd_transcribe_file(args) -> int:

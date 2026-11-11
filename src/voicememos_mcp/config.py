@@ -68,7 +68,10 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_SEGMENT_LONG": "1",
     "VOICEMEMOS_SEGMENT_MARGIN_MIN": "5",
     "VOICEMEMOS_SEGMENT_SILENCE_WINDOW_MIN": "10",
+    # After this many failed tries a memo is listed as "failed" and raises an alert; it is still
+    # tried again once a day. Before that the pauses are 5 min, 1 h and 6 h (worker.BACKOFF_S).
     "VOICEMEMOS_MAX_ATTEMPTS": "3",
+    "VOICEMEMOS_LOG_MAX_MB": "5",  # worker.log / worker.err.log are set aside as *.1 above this; 0 = never
     "VOICEMEMOS_MARKERS": "idea=Idea,task=Task,remember=Remember,question=Question",
     "VOICEMEMOS_MARKER_WAKE": "",
     "VOICEMEMOS_MARKER_END": "",
@@ -275,7 +278,14 @@ class Config:
 
     @property
     def max_attempts(self) -> int:
-        return int(self.get("VOICEMEMOS_MAX_ATTEMPTS"))
+        return max(1, int(self.get("VOICEMEMOS_MAX_ATTEMPTS")))
+
+    @property
+    def log_max_bytes(self) -> int:
+        try:
+            return int(float(self.get("VOICEMEMOS_LOG_MAX_MB") or 0) * 1024 * 1024)
+        except ValueError:
+            return 5 * 1024 * 1024
 
     # ---- secrets
     def secret(self, name: str) -> str | None:

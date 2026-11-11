@@ -39,7 +39,7 @@ FILENAME_TIMESTAMP = re.compile(r"(\d{8})[ _](\d{6})")
 ZOOM_TIMESTAMP = re.compile(r"GMT(\d{8})-(\d{6})")  # Zoom: GMT20261031-102304_Recording.m4a, UTC
 ISO_TIMESTAMP = re.compile(r"(\d{4}-\d{2}-\d{2})[ _T](\d{2})[.:_-]?(\d{2})")  # 2026-10-31_1223 Title.m4a
 IMPORT_FOLDER = "Imported"
-IMPORT_SIDECAR_KEYS = ("title", "recorded", "duration_s", "folder")
+IMPORT_SIDECAR_KEYS = ("title", "recorded", "duration_s", "folder", "duration_probed")
 
 TITLE_COLUMNS = ("ZENCRYPTEDTITLE", "ZCUSTOMLABELFORSORTING", "ZCUSTOMLABEL")
 
@@ -230,6 +230,31 @@ def read_import_sidecar(path: Path) -> dict:
     return {k: v for k, v in data.items() if k in IMPORT_SIDECAR_KEYS} if isinstance(data, dict) else {}
 
 
+def _probed_duration(path: Path, meta: dict, probe: Callable[[Path], float | None]) -> float | None:
+    """The duration from the sidecar, probing only when it is not there. The result (also "could
+    not be read") is written to the sidecar with the file's size and time, so a file dropped
+    into the folder by hand is probed once, not on every run, and again when it is replaced."""
+    try:
+        st = path.stat()
+    except OSError:
+        return meta.get("duration_s")
+    mark = f"{st.st_size}:{int(st.st_mtime)}"
+    if meta.get("duration_probed", mark) == mark and ("duration_s" in meta or "duration_probed" in meta):
+        return meta.get("duration_s")
+    duration = probe(path)
+    sidecar = path.with_name(path.name + ".json")
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
+        data = data if isinstance(data, dict) else {}
+        data.update(duration_s=round(duration, 3) if duration else None, duration_probed=mark)
+        tmp = sidecar.with_name(f".{sidecar.name}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        tmp.replace(sidecar)
+    except (OSError, ValueError):
+        pass  # a read-only folder: probed again next time, as before
+    return duration
+
+
 def read_imports(import_dir: Path, probe: Callable[[Path], float | None] | None = None) -> list[Memo]:
     """Memos for the audio files in the import folder, newest first; [] when the folder is missing.
 
@@ -259,8 +284,8 @@ def read_imports(import_dir: Path, probe: Callable[[Path], float | None] | None 
                 path.stat().st_mtime).astimezone()
             recorded = when.isoformat(timespec="seconds")
         duration = meta.get("duration_s")
-        if duration is None and probe is not None:
-            duration = probe(path)
+        if probe is not None:
+            duration = _probed_duration(path, meta, probe)
         title = str(meta.get("title") or path.stem).strip()
         memos.append(
             Memo(

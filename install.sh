@@ -87,8 +87,14 @@ echo "== 4/6 secrets (Keychain service: $SERVICE)"
 store_secret() {
   if security find-generic-password -s "$SERVICE" -a "$1" -w >/dev/null 2>&1; then
     echo "  $1: already stored"
+  elif [ ! -t 0 ]; then
+    # No terminal (ssh without -t, a deploy hook): nobody to ask, and `read` at end of input
+    # would stop the script here, before the launchd job is installed. Over ssh the login
+    # Keychain is usually locked, so a stored key can look missing too.
+    echo "  $1: not found or Keychain locked; skipped (no terminal to ask on)"
   else
-    read -r -p "  Store $1 in the Keychain now? [y/N] " answer
+    answer=""
+    read -r -p "  Store $1 in the Keychain now? [y/N] " answer || true
     if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
       # -w as the last argument makes `security` prompt for the value, so it never appears in `ps`.
       security add-generic-password -U -s "$SERVICE" -a "$1" -w && echo "  $1: stored"
@@ -103,15 +109,41 @@ true
 if [ "$DO_LAUNCHD" = "1" ]; then
   echo "== 5/6 launchd worker ($LABEL)"
   PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+  TARGET="gui/$(id -u)/$LABEL"
   mkdir -p "$HOME/Library/LaunchAgents"
+  # Written beside the plist and moved into place: a failing command must not leave an empty plist.
+  NEW_PLIST="$PLIST.new"
   if [ -n "$LAUNCHER" ]; then
-    "$WORKER_PY" -m voicememos_mcp launchd-plist --launcher "$LAUNCHER" > "$PLIST"
+    "$WORKER_PY" -m voicememos_mcp launchd-plist --launcher "$LAUNCHER" > "$NEW_PLIST"
   else
-    "$WORKER_PY" -m voicememos_mcp launchd-plist --python "$WORKER_PY" > "$PLIST"
+    "$WORKER_PY" -m voicememos_mcp launchd-plist --python "$WORKER_PY" > "$NEW_PLIST"
   fi
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"
-  echo "  installed $PLIST"
+  if [ -f "$PLIST" ] && cmp -s "$NEW_PLIST" "$PLIST" && launchctl print "$TARGET" >/dev/null 2>&1; then
+    # Same job, already loaded: leave it alone. Reloading would stop a transcription in progress;
+    # the new code is used from the worker's next start anyway.
+    rm -f "$NEW_PLIST"
+    echo "  $PLIST unchanged; job left running"
+  else
+    mv "$NEW_PLIST" "$PLIST"
+    launchctl bootout "$TARGET" 2>/dev/null || true
+    # bootout returns before the job is gone (a running worker first deletes what it sent to
+    # Soniox); bootstrap in that moment fails with "5: Input/output error". Wait, then retry.
+    for _ in $(seq 1 60); do
+      launchctl print "$TARGET" >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+    loaded=0
+    for _ in 1 2 3 4 5; do
+      if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then loaded=1; break; fi
+      sleep 2
+    done
+    if [ "$loaded" = "1" ]; then
+      echo "  installed $PLIST"
+    else
+      echo "  could not load the job; try:  launchctl bootstrap gui/$(id -u) \"$PLIST\""
+      exit 1
+    fi
+  fi
 else
   echo "== 5/6 launchd worker: skipped"
 fi

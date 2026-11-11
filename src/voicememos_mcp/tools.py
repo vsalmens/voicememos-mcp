@@ -130,6 +130,8 @@ class Tools:
         if not worker:
             warnings.append("The worker has never run. Install the launchd job (see README) or run "
                             "'voicememos-mcp sync'.")
+        elif not worker.get("state_readable", True):
+            warnings.append(f"Worker stopped: {worker.get('error')}")
         elif not worker.get("library_readable", True):
             warnings.append(f"Worker cannot read Voice Memos: {worker.get('error')}")
         elif worker.get("running"):
@@ -143,6 +145,9 @@ class Tools:
             except (TypeError, ValueError):
                 pass
         warnings += list(worker.get("warnings") or [])
+        alerts = [a for a in worker.get("alerts") or [] if isinstance(a, dict)]
+        warnings += [f"{a.get('line')} (since {a.get('since')})" for a in alerts
+                     if not any(str(a.get("line")) in w for w in warnings)]
         if worker.get("skipped"):
             warnings.append(f"{len(worker['skipped'])} memo(s) will not be transcribed: "
                             + "; ".join(f"{i['short_id']}: {i['error']}" for i in worker["skipped"][:5]))
@@ -162,6 +167,10 @@ class Tools:
                        "threshold": self.cfg.threshold},
             "auto_transcribe": self.cfg.flag("VOICEMEMOS_AUTO_TRANSCRIBE"),
             "roam_enabled": self.cfg.flag("VOICEMEMOS_ROAM_ENABLED"),
+            # What needs a person: [{"kind", "line", "since"}], empty when all is well.
+            "alerts": alerts,
+            # Sent to the engines per calendar month (audio minutes, tokens), newest first.
+            "usage": self.store.recent_usage(),
             "warnings": warnings,
         }
 

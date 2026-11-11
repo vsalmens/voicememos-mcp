@@ -3,6 +3,7 @@ import json
 import logging
 import sqlite3
 import subprocess
+import time
 
 import pytest
 
@@ -224,6 +225,8 @@ def test_only_the_failed_part_is_tried_again(tmp_path, library):
 
     second = FakeTranscriber()
     Worker(cfg, transcriber=second).run()
+    assert second.calls == []  # the failed part waits five minutes
+    Worker(cfg, transcriber=second, clock=lambda: time.time() + 400).run()
     assert second.calls == ["part2.m4a"]
     assert library_status(cfg)["status"] == "transcribed"
     assert not workdir.exists()
@@ -233,13 +236,15 @@ def test_only_the_failed_part_is_tried_again(tmp_path, library):
 def test_a_part_that_keeps_failing_fails_the_memo(tmp_path, library):
     make_long_memo(library, tmp_path)
     cfg = long_cfg(tmp_path, library, VOICEMEMOS_MAX_ATTEMPTS="2")
-    for _ in range(3):
-        Worker(cfg, transcriber=FakeTranscriber(fail_for=("part2",))).run()
+    for later in (0, 400):
+        Worker(cfg, transcriber=FakeTranscriber(fail_for=("part2",)), clock=lambda: time.time() + later).run()
     status = library_status(cfg)
     assert status["status"] == "failed" and "simulated failure" in status["error"]
     calls = FakeTranscriber()
-    Worker(cfg, transcriber=calls).run()
-    assert calls.calls == []  # no more automatic attempts
+    Worker(cfg, transcriber=calls, clock=lambda: time.time() + 1000).run()
+    assert calls.calls == []  # an hour's pause after the second failure
+    Worker(cfg, transcriber=calls, clock=lambda: time.time() + 400 + 3700).run()
+    assert calls.calls == ["part2.m4a"] and library_status(cfg)["status"] == "transcribed"
 
 
 @needs_ffmpeg

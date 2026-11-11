@@ -16,6 +16,12 @@ import command writes (title, recording time, duration, folder "Plaud"); the wor
 it like any imported recording. Only audio and its metadata are fetched: Plaud's own transcripts
 and summaries are not read. ``DATA_DIR/plaud.json`` remembers what was fetched, so a recording
 whose file is deleted from the import folder is not fetched again.
+
+The worker asks every minute, so an idle call is kept small: most calls list only the last
+few days (``RECENT_DAYS`` before the newest recording fetched), a full listing is made once an
+hour, a recording that fails is tried again after a growing pause (``FAILURE_BACKOFF_S``), and
+after a 429 nothing is asked until the time Plaud names. ``plaud.json`` is written only when
+something in it changes.
 """
 
 from __future__ import annotations
@@ -38,6 +44,10 @@ REFRESH_PATH = "/oauth/third-party/access-token/refresh"
 PLAUD_FOLDER = "Plaud"
 PAGE_SIZE = 100
 MAX_PAGES = 1000
+RECENT_DAYS = 3  # a recording reaches the cloud, and gets its AI title, well within this
+FULL_LISTING_EVERY_S = 3600  # catches what the short listing cannot: old recordings synced late
+FAILURE_BACKOFF_S = (300, 3600, 6 * 3600, 86400)  # per recording: after the 1st, 2nd, 3rd failure, then daily
+RATE_LIMIT_BACKOFF_S = (300, 900, 3600)  # after a 429 without Retry-After
 REFRESH_MARGIN_MS = 60_000
 # Containers Soniox reads as they are (audio.DIRECT_EXTENSIONS) that a recorder may produce.
 KNOWN_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".aac", ".mp4"}
@@ -53,6 +63,25 @@ class PlaudError(RuntimeError):
 
 class PlaudAuthError(PlaudError):
     """No usable tokens: the user has to run ``plaud login`` again."""
+
+
+class PlaudRateLimited(PlaudError):
+    """429: stop asking for a while (``retry_after`` seconds when the answer says how long)."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _epoch(iso) -> float:
+    try:
+        return dt.datetime.fromisoformat(iso).timestamp() if iso else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _iso(epoch: float) -> str:
+    return dt.datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="seconds")
 
 
 def parse_time(value) -> dt.datetime | None:
@@ -180,6 +209,9 @@ class Plaud:
                 continue  # a token without expires_at, or one revoked early: refresh once
             if response.status_code in (401, 403):
                 raise PlaudAuthError(f"Plaud refused the request ({response.status_code}); run `plaud login`")
+            if response.status_code == 429:
+                wait = str((getattr(response, "headers", None) or {}).get("Retry-After") or "").strip()
+                raise PlaudRateLimited(f"Plaud 429 for {path}", float(wait) if wait.isdigit() else None)
             if not response.ok:
                 raise PlaudError(f"Plaud {response.status_code} for {path}: {response.text[:200]}")
             return response.json()
@@ -188,14 +220,20 @@ class Plaud:
     def list_files(self, since: dt.datetime | None = None) -> list[dict]:
         """Every recording of the account (from ``since`` on), as the API lists them."""
         files: list[dict] = []
+        seen: set[str] = set()
         for page in range(1, MAX_PAGES + 1):
             params = {"page": page, "page_size": PAGE_SIZE}
             if since is not None:
                 params["start_date"] = int(since.timestamp() * 1000)
             batch = self._get("/open/third-party/files/", params).get("data") or []
-            files += [f for f in batch if isinstance(f, dict) and f.get("id")]
-            if len(batch) < PAGE_SIZE:
+            fresh = [f for f in batch if isinstance(f, dict) and f.get("id") and str(f["id"]) not in seen]
+            # Not "a short page": a server that caps the page size below PAGE_SIZE would then
+            # show its first page only. An empty page ends the list, and so does a page with
+            # nothing new (a server that ignores the page number).
+            if not fresh:
                 break
+            seen.update(str(f["id"]) for f in fresh)
+            files += fresh
         return files
 
     def get_file(self, file_id: str) -> dict:
@@ -253,28 +291,69 @@ def _write_sidecar(audio: Path, meta: dict) -> None:
         json.dumps(meta, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
 
+def _rate_limit(state: dict, now: float, exc: PlaudRateLimited) -> str:
+    count = int((state.get("rate_limited") or {}).get("count", 0)) + 1
+    wait = max(exc.retry_after or 0, RATE_LIMIT_BACKOFF_S[min(count, len(RATE_LIMIT_BACKOFF_S)) - 1])
+    state["rate_limited"] = {"until": _iso(now + wait), "count": count}
+    log.warning("Plaud asked for fewer requests (429); next try at %s", state["rate_limited"]["until"])
+    return state["rate_limited"]["until"]
+
+
 def fetch_new(client: Plaud, import_dir: Path, state_path: Path, since: str = "", limit: int | None = None,
-              dry_run: bool = False) -> dict:
+              dry_run: bool = False, clock=time.time) -> dict:
     """Download the recordings not fetched before. Returns a summary without titles (it is logged).
 
-    One recording failing does not stop the others; a failed login stops the run (``PlaudAuthError``).
-    A recording whose audio is not in the cloud yet (still on the device or the phone) has no link
-    and is tried again on the next run. A recording renamed in Plaud after it was fetched gets the
-    new title in its sidecar; a transcript already written keeps the title it had.
+    One recording failing does not stop the others; it is tried again after a pause that grows
+    with every failure. A failed login stops the run (``PlaudAuthError``). A recording whose
+    audio is not in the cloud yet (still on the device or the phone) has no link and is tried
+    again on the next run. A recording renamed in Plaud after it was fetched gets the new title
+    in its sidecar; the worker carries it into the transcript.
     """
     state = read_json(state_path, {}) or {}
     known: dict = state.setdefault("files", {})
+    failures: dict = state.setdefault("failures", {})
+    before = json.dumps(state, sort_keys=True)
+    now = clock()
+    summary: dict = {"listed": 0, "fetched": [], "waiting": [], "failed": [], "renamed": 0, "failing": len(failures)}
+
+    def save() -> None:
+        if not dry_run and json.dumps(state, sort_keys=True) != before:
+            state["checked"] = _iso(now)
+            write_json_atomic(state_path, state)
+
+    until = (state.get("rate_limited") or {}).get("until")
+    if not dry_run and _epoch(until) > now:
+        summary["rate_limited"] = until
+        return summary
     since_dt = None
     if since:
         try:
             since_dt = dt.datetime.fromisoformat(since).astimezone()
         except ValueError:
             raise PlaudError(f"VOICEMEMOS_PLAUD_SINCE must be YYYY-MM-DD, got {since!r}") from None
-    files = client.list_files(since_dt)
+    # Most runs ask only for the days around the newest recording fetched; once an hour for all.
+    starts = [_epoch(e.get("start")) for e in known.values() if e.get("start")]
+    full = dry_run or not starts or now - _epoch(state.get("listed_all")) >= FULL_LISTING_EVERY_S
+    list_since = since_dt
+    if not full:
+        recent = dt.datetime.fromtimestamp(max(starts) - RECENT_DAYS * 86400).astimezone()
+        list_since = max(since_dt, recent) if since_dt else recent
+    try:
+        files = client.list_files(list_since)
+    except PlaudRateLimited as exc:
+        summary["rate_limited"] = _rate_limit(state, now, exc)
+        save()
+        return summary
+    state.pop("rate_limited", None)
     files.sort(key=lambda f: (_start(f) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)))
-    summary: dict = {"listed": len(files), "fetched": [], "waiting": [], "failed": []}
+    summary["listed"] = len(files)
     if not dry_run:
         import_dir.mkdir(parents=True, exist_ok=True)
+    if full and not dry_run:
+        state["listed_all"] = _iso(now)
+        listed = {str(f["id"]) for f in files}
+        for gone in [k for k in failures if k not in listed]:  # deleted in Plaud: nothing to retry
+            del failures[gone]
     for file in files:
         file_id = str(file["id"])
         started = _start(file)
@@ -282,17 +361,23 @@ def fetch_new(client: Plaud, import_dir: Path, state_path: Path, since: str = ""
             continue  # the server-side filter is not applied for every account
         entry = known.get(file_id)
         if entry:
+            if started and not entry.get("start"):
+                entry["start"] = started.isoformat(timespec="seconds")
             name = str(file.get("name") or "").strip()
             audio = import_dir / str(entry.get("filename") or "")
             if name and name != entry.get("name") and entry.get("filename") and audio.is_file() and not dry_run:
-                _write_sidecar(audio, _sidecar(file))
+                _write_sidecar(audio, {**_kept(audio), **_sidecar(file)})
                 entry["name"] = name
+                summary["renamed"] += 1
             continue
         if limit is not None and len(summary["fetched"]) >= limit:
             break
         if dry_run:
             summary["fetched"].append(file_id)
             continue
+        failure = failures.get(file_id) or {}
+        if _epoch(failure.get("next_try")) > now:
+            continue  # failed a while ago; its pause is not over
         try:
             detail = client.get_file(file_id)
             url = detail.get("presigned_url")
@@ -306,18 +391,35 @@ def fetch_new(client: Plaud, import_dir: Path, state_path: Path, since: str = ""
             if when:  # the recording's own time: old enough for the worker to take it in this run
                 os.utime(audio, (when.timestamp(), when.timestamp()))
             known[file_id] = {"filename": audio.name, "name": str(merged.get("name") or "").strip(),
-                              "fetched": now_iso()}
+                              "fetched": now_iso(), **({"start": when.isoformat(timespec="seconds")} if when else {})}
+            failures.pop(file_id, None)
             summary["fetched"].append(file_id)
             write_json_atomic(state_path, state)
         except PlaudAuthError:
+            save()
             raise
+        except PlaudRateLimited as exc:
+            summary["rate_limited"] = _rate_limit(state, now, exc)
+            break
         except Exception as exc:  # noqa: BLE001 - one recording must not stop the others
-            log.warning("Plaud recording %s not fetched: %s", file_id, exc)
-            summary["failed"].append({"id": file_id, "error": str(exc)[:200]})
-    if not dry_run:
-        state["checked"] = now_iso()
-        write_json_atomic(state_path, state)
+            count = int(failure.get("count", 0)) + 1
+            pause = FAILURE_BACKOFF_S[min(count, len(FAILURE_BACKOFF_S)) - 1]
+            failures[file_id] = {"count": count, "error": str(exc)[:200], "at": _iso(now),
+                                 "next_try": _iso(now + pause)}
+            log.warning("Plaud recording %s not fetched (try %d, next in %d min): %s", file_id, count, pause // 60, exc)
+            summary["failed"].append({"id": file_id, "error": str(exc)[:200], "tries": count})
+    summary["failing"] = len(failures)
+    save()
     return summary
+
+
+def _kept(audio: Path) -> dict:
+    """What the worker added to a sidecar (a probed duration) survives a rename."""
+    try:
+        data = json.loads(audio.with_name(audio.name + ".json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if k in ("duration_s", "duration_probed")} if isinstance(data, dict) else {}
 
 
 def client_from_config(cfg, session=None) -> Plaud:

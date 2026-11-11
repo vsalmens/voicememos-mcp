@@ -63,10 +63,23 @@ def test_imported_files_are_transcribed_like_memos(cfg, fake):
     run(cfg, fake)
     assert len(fake.calls) == 3  # not transcribed again
 
-    audio.unlink()
+    audio.unlink()  # the audio removed to save space: the transcript stays listed and readable
     run(cfg, fake)
     library = json.loads((cfg.data_dir / "library.json").read_text())
-    assert all(m["title"] != "Alhovuori meeting" for m in library["memos"])  # file gone, memo gone
+    item = next(m for m in library["memos"] if m["title"] == "Alhovuori meeting")
+    assert item["status"] == "audio_removed" and item["recorded"] == "2026-10-31T12:23:04+02:00"
+    assert item["folder"] == "Imported" and not item["local"]
+    tools = Tools(cfg)
+    assert "Hello world (?)." in tools.read(item["short_id"])["text"]
+    assert [m["title"] for m in tools.list_memos(status="audio_removed")["memos"]] == ["Alhovuori meeting"]
+    assert tools.search("bird house", since="2026-10-31", until="2026-10-31")["count"] == 1
+    md.unlink(), md.with_suffix(".json").unlink()  # the transcript deleted as well: nothing left to list
+    state = json.loads((cfg.data_dir / "state.json").read_text())
+    state[item["id"]].pop("memo")
+    (cfg.data_dir / "state.json").write_text(json.dumps(state))
+    run(cfg, fake)
+    library = json.loads((cfg.data_dir / "library.json").read_text())
+    assert all(m["title"] != "Alhovuori meeting" for m in library["memos"])
 
 
 def test_imports_are_not_pushed_to_roam(cfg, fake, monkeypatch):
@@ -138,15 +151,37 @@ def test_since_limits_automatic_transcription(tmp_path, library, fake):
     assert run(c, fake)["transcribed"] == []
 
 
-def test_failures_are_counted_and_capped(cfg):
+def test_failures_are_retried_after_growing_pauses(cfg):
+    """Three quick failures used to end a memo for good; now each failure only lengthens the pause."""
     failing = FakeTranscriber(fail_for=("AAAA1111",))
-    for _ in range(4):
-        run(cfg, failing)
-    attempts = [c for c in failing.calls if "AAAA1111" in c]
-    assert len(attempts) == 3  # VOICEMEMOS_MAX_ATTEMPTS
-    library = json.loads((cfg.data_dir / "library.json").read_text())
-    walk = next(m for m in library["memos"] if m["title"] == "Morning walk")
-    assert walk["status"] == "failed" and "simulated" in walk["error"]
+    tries = lambda: len([c for c in failing.calls if "AAAA1111" in c])  # noqa: E731
+    walk = lambda: next(m for m in json.loads((cfg.data_dir / "library.json").read_text())["memos"]  # noqa: E731
+                        if m["title"] == "Morning walk")
+    start = time.time()
+    at = lambda seconds: Worker(cfg, transcriber=failing, clock=lambda: start + seconds).run()  # noqa: E731
+    at(0), at(60), at(120)
+    assert tries() == 1 and walk()["status"] == "pending"  # the minute runs in between wait
+    at(400)
+    assert tries() == 2
+    at(1000), at(3000)
+    assert tries() == 2  # an hour after the second failure
+    worker = at(400 + 3700)
+    assert tries() == 3 and walk()["status"] == "failed" and "simulated" in walk()["error"]
+    alert = json.loads((cfg.data_dir / "worker.json").read_text())["alerts"][0]
+    assert alert["kind"] == "memo_failed" and "aaaa1111" in alert["line"] and "Morning walk" not in alert["line"]
+    assert worker["alerts"] == [alert]
+    at(400 + 3700 + 3600)
+    assert tries() == 3  # six hours now
+    at(400 + 3700 + 7 * 3600)
+    assert tries() == 4
+    at(400 + 3700 + 20 * 3600)
+    assert tries() == 4  # then once a day
+    again = at(400 + 3700 + 32 * 3600)
+    assert tries() == 5 and again["alerts"][0]["since"] == alert["since"]  # the alert keeps its first time
+
+    fine = FakeTranscriber()
+    summary = Worker(cfg, transcriber=fine, clock=lambda: start + 10 * 86400).run()
+    assert len(fine.calls) == 1 and walk()["status"] == "transcribed" and summary["alerts"] == []
 
 
 def test_queue_request_from_tools_is_processed(cfg, fake):

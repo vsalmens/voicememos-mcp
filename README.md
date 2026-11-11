@@ -34,6 +34,35 @@ Claude ──MCP──▶ voicememos-mcp serve  ── reads ──▶ library.j
 
 The worker runs when the recordings folder, the import folder or the queue changes, and on a
 timer: every 30 minutes, or every minute with a Plaud recorder (`VOICEMEMOS_POLL_INTERVAL_S`).
+A run that finds nothing to do writes only `worker.json` and nothing to its log.
+
+### When something goes wrong
+
+* **A memo fails.** It is tried again after 5 minutes, then 1 hour, then 6 hours, then once a
+  day. After `VOICEMEMOS_MAX_ATTEMPTS` (3) tries it is listed as `failed` and raises an alert,
+  and the daily tries go on. When the engine itself cannot be reached (no network, a refused or
+  missing key), the try is not counted and the other memos are not tried in that run.
+* **A recording changes** (recorded on, edited, `import --replace`): a different file size means
+  it is transcribed again; the earlier transcript stands until the new one is written. A new
+  modification time alone does not count, because iCloud gives a file it downloads again one.
+* **A run is killed.** The engine's answer is saved in `DATA_DIR/tmp/<memo id>/` before the
+  second reading and the write, so the next run does not pay for the same audio twice. What was
+  at Soniox at that moment is noted in `DATA_DIR/soniox-pending.json` and deleted by the next run.
+* **`state.json` cannot be read.** The worker stops (alert `state_unreadable`) instead of
+  starting from nothing, which would transcribe everything again. Copy `state.json.bak` (the
+  state before the last change) over it.
+* **Alerts.** `worker.json` has `alerts`, an empty list when all is well, otherwise one entry
+  per kind: `{"kind": "plaud_login" | "plaud_fetch" | "memo_failed" | "state_unreadable",
+  "line": "<one sentence, no titles>", "since": "<when it first appeared>"}`. `voicememos_status`
+  shows the same list. A Plaud fetch has to fail for ten minutes before it is an alert.
+* **Logs.** `logs/worker.log` and `worker.err.log` are set aside as `*.1` when they pass
+  `VOICEMEMOS_LOG_MAX_MB` (5), one generation each.
+
+### What it has cost
+
+`DATA_DIR/usage.json` counts per calendar month what was sent to the engines: audio minutes and
+files to Soniox, tokens and calls to Gemini (counted from version 0.8; not prices, which
+change). `voicememos_status` and `voicememos-mcp check` show the last months.
 
 ## Uncertainty notation
 
@@ -172,17 +201,25 @@ of the account should be fetched and transcribed) and run `./install.sh`.
   next run. Syncing the recorder to the phone is still up to the Plaud app.
 * Plaud's cloud cannot be watched, only asked, so with `VOICEMEMOS_PLAUD=1` the worker runs every
   minute instead of every 30 (`VOICEMEMOS_POLL_INTERVAL_S`, at least 30; `./install.sh` applies a
-  change). A run with nothing new is one list call and under a second. A recording is
+  change). A run with nothing new is a short list call (the last three days; the whole account
+  once an hour, which also finds old recordings synced late) and under a second. A recording is
   transcribed in the run that fetched it, so the delay after it reaches the cloud is at most the
   interval plus the transcription itself (well under a minute for a ten-minute recording).
   While a long recording is being transcribed the next ones wait for it.
-* What has been fetched is kept in `DATA_DIR/plaud.json`. Deleting a file from the import folder
-  removes the memo and it is not fetched again; delete its entry in `plaud.json` to get it back.
+* What has been fetched is kept in `DATA_DIR/plaud.json`. A file deleted from the import folder
+  (to save space, say) is not fetched again, and its transcript stays listed and readable with
+  the status `audio_removed`; delete its entry in `plaud.json` to get the audio back.
 * A recording renamed in Plaud later (its AI gives titles after a summary) gets the new title in
-  the library; a transcript already written keeps its title until transcribed again.
+  the library and in its transcript: the front matter, the heading and the JSON, without
+  transcribing again. The file keeps its path, which carries the first title, so that programs
+  indexing the folder see a changed file and not a new one. The same holds for a memo renamed
+  in Voice Memos.
+* A recording that cannot be fetched is tried again after 5 minutes, 1 hour, 6 hours and then
+  daily, not every minute; after a 429 nothing is asked until the time Plaud names.
 * A failed fetch (no network, login expired) is a warning in `voicememos_status` and in the
-  worker log, and never stops Voice Memos from being transcribed. When the login is refused:
-  `plaud login` again.
+  worker log, an alert when it lasts (at once for a refused login), and never stops Voice Memos
+  from being transcribed. When the login is refused: `plaud login` again.
+* `voicememos-mcp plaud` waits its turn: it does not fetch while the worker is running.
 
 ## Spoken markers
 
@@ -295,7 +332,9 @@ $EDITOR ~/.config/voicememos-mcp/config.env
 
 `install.sh` installs the MCP server with `uv tool`, creates a separate virtualenv for the
 worker, stores the Soniox key in the Keychain, installs the launchd job and adds this to
-`claude_desktop_config.json`:
+`claude_desktop_config.json`. It can be run again at any time, also without a terminal (over
+ssh, from a deploy hook): then it does not ask for keys, and when the job definition has not
+changed it leaves the job alone, so a transcription in progress is not stopped.
 
 ```json
 "voicememos": { "command": "/Users/<you>/.local/bin/voicememos-mcp", "args": ["serve"] }
@@ -366,6 +405,8 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_PLAUD_OUTPUT_DIR` | `DATA_DIR/plaud-transcripts` | where a Plaud recorder's transcripts are written |
 | `VOICEMEMOS_PLAUD_SINCE` | | only recordings from this date on |
 | `VOICEMEMOS_POLL_INTERVAL_S` | `1800`, `60` with Plaud | seconds between the worker's timed runs |
+| `VOICEMEMOS_MAX_ATTEMPTS` | `3` | failed tries after which a memo is listed as `failed` and raises an alert (it is still tried daily) |
+| `VOICEMEMOS_LOG_MAX_MB` | `5` | size at which a worker log is set aside as `*.1`; `0` = never |
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
 | `VOICEMEMOS_SKIP_TITLE_KEYWORD` | `notranscript` | memos with this word in the title are listed but never transcribed |
@@ -391,7 +432,7 @@ titles.
 
 | Tool | |
 |---|---|
-| `voicememos_status` | counts by status, worker health, configuration, warnings |
+| `voicememos_status` | counts by status, worker health, alerts, usage per month, configuration, warnings |
 | `voicememos_list` | memos newest first; filter by date, title, status; paging |
 | `voicememos_read` | one transcript as Markdown, plain text or word-level JSON; optional `threshold` re-renders without re-transcribing; paging for long memos |
 | `voicememos_search` | case-insensitive search (or regex) over transcripts and titles, with snippets |
@@ -407,14 +448,16 @@ Memo status values: `transcribed`, `pending` (will be transcribed automatically)
 `VOICEMEMOS_SKIP_TITLE_KEYWORD`, then the memo is not transcribed even on request),
 `not_downloaded` (audio still in iCloud; play it once in Voice Memos on the Mac),
 `segmenting` (longer than the engine accepts; being transcribed in parts),
-`failed` (after `VOICEMEMOS_MAX_ATTEMPTS` tries; for a memo in parts, of one part),
+`failed` (after `VOICEMEMOS_MAX_ATTEMPTS` tries; for a memo in parts, of one part; still tried
+again once a day),
 `too_long` (long, and splitting is off or ffmpeg is missing; listed under `skipped` in
-`worker.json` and as a warning in `voicememos_status`), `deleted`.
+`worker.json` and as a warning in `voicememos_status`), `audio_removed` (transcribed, and the
+recording has since been removed; the transcript can still be read and searched), `deleted`.
 
 ## Command line
 
 ```bash
-voicememos-mcp check                         # paths, permissions, keys
+voicememos-mcp check                         # paths, permissions, keys, what the next run would do, usage
 voicememos-mcp sync --dry-run --limit 1      # one memo, print only, save nothing
 voicememos-mcp sync --memo 1a2b3c4d --redo   # transcribe one memo again
 voicememos-mcp import meeting.m4a --title "Board meeting"   # a recording from elsewhere, transcribed like a memo
@@ -439,7 +482,8 @@ transcripts without new API calls.
   the recording. Large files uploaded through
   the Files API are deleted right after the request.
 * Audio goes to Soniox for transcription. The uploaded file and the transcription are
-  deleted from Soniox right after the transcript is fetched, also when something fails.
+  deleted from Soniox right after the transcript is fetched, also when something fails or the
+  worker is stopped; if the process is killed outright, the next run deletes them.
   Soniox offers an EU endpoint (`SONIOX_BASE_URL=https://api.eu.soniox.com`), which needs an
   EU project.
 * Nothing in the Voice Memos container is modified. The database is opened read-only.
@@ -460,6 +504,7 @@ transcripts without new API calls.
   split, transcribed part by part and merged: time stamps run through the whole recording and
   the front matter gets `segments` and `segment_bounds_s`. Finished parts are kept in
   `tmp/<memo id>/` until the memo is done, so a failed part is the only one sent again.
+  The parts keep the recording's own format (MP3 parts for a Plaud recording).
   Diarization labels hold within one part only (`S1a`, `S1b`; Soniox gives no speaker
   embeddings to match them across parts); the voiceprint is applied to every part.
 * The Roam Append API request format follows public examples; test with one memo first.

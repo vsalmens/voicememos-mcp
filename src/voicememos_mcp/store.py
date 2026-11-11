@@ -8,12 +8,15 @@
 ``DATA_DIR`` (internal state)::
 
     library.json   snapshot of the Voice Memos library, written by the worker
-    state.json     per-memo processing state (fingerprint, attempts, outputs)
-    worker.json    last worker run: time, result, permission status
+    state.json     per-memo processing state (fingerprint, attempts, outputs); state.json.bak is
+                   the file before the last change
+    worker.json    last worker run: time, result, permission status, alerts
+    usage.json     audio minutes and tokens sent to the engines, per calendar month
     queue/         transcription requests written by the MCP server
     jobs/          job progress written by the worker (also one job per part of a memo in parts)
-    tmp/<memo id>/ parts of a memo longer than the engine accepts, and their raw results;
-                   removed when the memo is done, kept after a failure for diagnosis
+    tmp/<memo id>/ the engine's raw result until the transcript is written, and the parts of a
+                   memo longer than the engine accepts; removed when the memo is done, kept
+                   after a failure for the next try
     logs/          worker logs (launchd)
 
 The split lets the MCP server run without access to the Voice Memos container:
@@ -26,6 +29,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import tempfile
 import unicodedata
 import uuid
@@ -42,12 +46,47 @@ def now_iso() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def write_json_atomic(path: Path, data) -> None:
+class StateError(RuntimeError):
+    """state.json exists but cannot be read. Treating it as empty would transcribe (and pay for)
+    every memo again, so the worker stops instead."""
+
+
+def write_json_atomic(path: Path, data, keep_backup: bool = False) -> None:
+    """Write through a temporary file that is flushed to disk before it replaces ``path``:
+    without the fsync a power cut can leave an empty file under the final name.
+    With ``keep_backup`` the file being replaced stays as ``<name>.bak``."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if keep_backup and path.exists():
+            backup = path.with_name(path.name + ".bak")
+            link = path.with_name(f".{path.name}.bak.tmp")
+            link.unlink(missing_ok=True)
+            try:
+                os.link(path, link)  # no copy, and ``path`` is never missing
+            except OSError:
+                shutil.copy2(path, link)
+            os.replace(link, backup)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def write_json_if_changed(path: Path, data, ignore: tuple[str, ...] = ()) -> bool:
+    """Write only when the content differs from the file (top-level keys in ``ignore`` aside).
+    The worker runs every minute; a snapshot that says the same thing is not written again."""
+    fresh = json.loads(json.dumps(data, ensure_ascii=False))
+    current = read_json(path)
+    if isinstance(current, dict) and isinstance(fresh, dict) \
+            and {k: v for k, v in current.items() if k not in ignore} == {k: v for k, v in fresh.items()
+                                                                           if k not in ignore}:
+        return False
+    write_json_atomic(path, data)
+    return True
 
 
 def read_json(path: Path, default=None):
@@ -114,14 +153,53 @@ class Store:
     def read_library(self) -> dict:
         return read_json(self.library_path, {"memos": [], "updated": None})
 
-    def write_library(self, data: dict) -> None:
-        write_json_atomic(self.library_path, data)
+    def write_library(self, data: dict) -> bool:
+        """False when nothing but the time stamp would change (the file is left alone)."""
+        return write_json_if_changed(self.library_path, data, ignore=("updated",))
 
     def read_state(self) -> dict:
-        return read_json(self.state_path, {})
+        """{} when there is no state yet; ``StateError`` when the file is there but broken."""
+        try:
+            text = self.state_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        try:
+            state = json.loads(text)
+        except ValueError as exc:
+            state = exc
+        if not isinstance(state, dict):
+            raise StateError(
+                f"{self.state_path} cannot be read ({state if isinstance(state, Exception) else 'not an object'}). "
+                f"Nothing is transcribed until it is repaired: copy {self.state_path.name}.bak over it "
+                "(the state before the last change), or delete both files to start over, which "
+                "transcribes every memo again.")
+        return state
 
     def write_state(self, state: dict) -> None:
-        write_json_atomic(self.state_path, state)
+        write_json_atomic(self.state_path, state, keep_backup=True)
+
+    @property
+    def usage_path(self) -> Path:
+        return self.data_dir / "usage.json"
+
+    def read_usage(self) -> dict:
+        data = read_json(self.usage_path, {})
+        return data if isinstance(data, dict) and isinstance(data.get("months"), dict) else {"months": {}}
+
+    def recent_usage(self, months: int = 3) -> dict:
+        """The last months' totals, newest first: ``{"2026-11": {"soniox_audio_min": ...}}``."""
+        data = self.read_usage()["months"]
+        return {month: data[month] for month in sorted(data, reverse=True)[:months]}
+
+    def add_usage(self, **amounts: float) -> None:
+        """Add to this calendar month's totals (what was sent to the engines; see README)."""
+        usage = self.read_usage()
+        month = usage["months"].setdefault(dt.datetime.now().strftime("%Y-%m"), {})
+        for key, value in amounts.items():
+            if value:
+                month[key] = round(month.get(key, 0) + value, 2)
+        usage["updated"] = now_iso()
+        write_json_atomic(self.usage_path, usage)
 
     def read_worker(self) -> dict:
         return read_json(self.worker_path, {})
@@ -147,8 +225,13 @@ class Store:
         """Move a memo's transcript pair to the directory its folder now belongs to (the setting
         changed, or the transcript was written before the folder had a directory of its own).
         Updates the paths in ``entry``; True when something moved."""
-        current = self._resolve(entry.get("json") or "")
-        root = self.root_for(memo).resolve()
+        stored, home = entry.get("json") or "", self.root_for(memo)
+        # The usual case, without touching the disk (this runs for every transcript on every run).
+        if (home == self.output_dir and not os.path.isabs(stored)) or \
+                (os.path.isabs(stored) and Path(stored).parent.parent == home):
+            return False
+        current = self._resolve(stored)
+        root = home.resolve()
         if current is None or root in current.parents or not current.exists():
             return False
         target = self.root_for(memo) / current.parent.name / current.name
@@ -224,6 +307,41 @@ class Store:
                                                 encoding="utf-8")
         return {"json": relative_json, "markdown": str(Path(relative_json).with_suffix(".md")),
                 "stats": data["stats"], "markers": data["markers"]}
+
+    def retitle(self, stored_json: str, title: str | None) -> bool:
+        """Give an existing transcript a new title without rendering it again: the JSON's memo
+        block, and in the Markdown file the front matter line and the heading. The path stays
+        (it carries the old title's slug): readers that key items by path see a change, not a
+        delete and an add. True when something was written."""
+        json_path = self._resolve(stored_json)
+        data = read_json(json_path) if json_path is not None else None
+        if not data or not isinstance(data.get("memo"), dict) or data["memo"].get("title") == title:
+            return False
+        data["memo"]["title"] = title
+        data["updated"] = now_iso()
+        write_json_atomic(json_path, data)
+        md_path = json_path.with_suffix(".md")
+        try:
+            lines = md_path.read_text(encoding="utf-8").split("\n")
+        except FileNotFoundError:
+            return True
+        shown = title or "Voice memo"
+        if lines and lines[0] == "---" and "---" in lines[1:]:
+            end = lines.index("---", 1)
+            for k in range(1, end):
+                if lines[k].startswith("title: "):
+                    lines[k] = f"title: {json.dumps(shown, ensure_ascii=False)}"
+                    break
+            for k in range(end + 1, len(lines)):
+                if lines[k].startswith("# "):
+                    lines[k] = f"# {shown}"
+                    break
+                if lines[k].startswith("## "):
+                    break
+            tmp = md_path.with_name(f".{md_path.name}.tmp")
+            tmp.write_text("\n".join(lines), encoding="utf-8")
+            os.replace(tmp, md_path)
+        return True
 
     def load_transcript(self, relative_json: str) -> dict | None:
         path = self._resolve(relative_json)
