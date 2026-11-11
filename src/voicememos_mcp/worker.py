@@ -10,7 +10,7 @@ One run (``voicememos-mcp sync``):
 5. record the result in ``worker.json``.
 
 On macOS it runs from launchd, triggered by changes in the recordings folder or
-the queue folder and every 30 minutes. Only this process needs Full Disk Access.
+the queue folder and on a timer (30 minutes; every minute with a Plaud recorder). Only this process needs Full Disk Access.
 """
 
 from __future__ import annotations

@@ -32,7 +32,8 @@ Claude ──MCP──▶ voicememos-mcp serve  ── reads ──▶ library.j
                         └── writes ──▶ DATA_DIR/queue/  (picked up by the worker)
 ```
 
-The worker runs when the recordings folder or the queue changes, and every 30 minutes.
+The worker runs when the recordings folder, the import folder or the queue changes, and on a
+timer: every 30 minutes, or every minute with a Plaud recorder (`VOICEMEMOS_POLL_INTERVAL_S`).
 
 ## Uncertainty notation
 
@@ -168,7 +169,13 @@ of the account should be fetched and transcribed) and run `./install.sh`.
   usage statistics Plaud's tool otherwise sends (PostHog).
 * Only audio, name, times and duration are read. Plaud's own transcripts and summaries are not.
 * A recording that has not reached the cloud yet has no audio link and is tried again on the
-  next run (every 30 minutes). Syncing the recorder to the phone is still up to the Plaud app.
+  next run. Syncing the recorder to the phone is still up to the Plaud app.
+* Plaud's cloud cannot be watched, only asked, so with `VOICEMEMOS_PLAUD=1` the worker runs every
+  minute instead of every 30 (`VOICEMEMOS_POLL_INTERVAL_S`, at least 30; `./install.sh` applies a
+  change). A run with nothing new is one list call and under a second. A recording is
+  transcribed in the run that fetched it, so the delay after it reaches the cloud is at most the
+  interval plus the transcription itself (well under a minute for a ten-minute recording).
+  While a long recording is being transcribed the next ones wait for it.
 * What has been fetched is kept in `DATA_DIR/plaud.json`. Deleting a file from the import folder
   removes the memo and it is not fetched again; delete its entry in `plaud.json` to get it back.
 * A recording renamed in Plaud later (its AI gives titles after a summary) gets the new title in
@@ -358,6 +365,7 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_PLAUD` | `0` | `1` = fetch a Plaud recorder's recordings into the import folder, see [Plaud recorder](#plaud-recorder) |
 | `VOICEMEMOS_PLAUD_OUTPUT_DIR` | `DATA_DIR/plaud-transcripts` | where a Plaud recorder's transcripts are written |
 | `VOICEMEMOS_PLAUD_SINCE` | | only recordings from this date on |
+| `VOICEMEMOS_POLL_INTERVAL_S` | `1800`, `60` with Plaud | seconds between the worker's timed runs |
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
 | `VOICEMEMOS_SKIP_TITLE_KEYWORD` | `notranscript` | memos with this word in the title are listed but never transcribed |

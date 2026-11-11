@@ -28,6 +28,10 @@ RECORDINGS_DIR_CANDIDATES = (
     "~/Library/Application Support/com.apple.voicememos/Recordings",  # older macOS
 )
 
+POLL_INTERVAL_S = 1800  # Voice Memos and the queue are watched; the timed run is a safety net
+PLAUD_POLL_INTERVAL_S = 60  # an idle run is one list call to Plaud and under a second of work
+MIN_POLL_INTERVAL_S = 30
+
 DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_RECORDINGS_DIR": "",
     "VOICEMEMOS_IMPORT_DIR": "",  # default DATA_DIR/imports
@@ -38,6 +42,9 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_PLAUD_TOKENS": "~/.plaud/tokens.json",  # written by `plaud login` (@plaud-ai/cli)
     "VOICEMEMOS_PLAUD_API_BASE": "",  # default https://platform.plaud.ai/developer/api
     "VOICEMEMOS_PLAUD_REGION": "",  # sent as x-pld-region when set; normally not needed
+    # How often launchd starts the worker besides the folder watches. Empty = 1800, or 60 with
+    # VOICEMEMOS_PLAUD=1: Plaud's cloud cannot be watched, only asked.
+    "VOICEMEMOS_POLL_INTERVAL_S": "",
     "VOICEMEMOS_DATA_DIR": "~/Library/Application Support/voicememos-mcp",
     "VOICEMEMOS_OUTPUT_DIR": "~/Library/Application Support/voicememos-mcp/transcripts",
     "VOICEMEMOS_LANGUAGES": "en",
@@ -244,6 +251,14 @@ class Config:
     @property
     def since(self) -> str:
         return self.get("VOICEMEMOS_SINCE")
+
+    @property
+    def poll_interval_s(self) -> int:
+        """Seconds between the worker's timed runs (launchd StartInterval), at least 30."""
+        explicit = self.get("VOICEMEMOS_POLL_INTERVAL_S").strip()
+        if not explicit:
+            return PLAUD_POLL_INTERVAL_S if self.flag("VOICEMEMOS_PLAUD") else POLL_INTERVAL_S
+        return max(MIN_POLL_INTERVAL_S, int(float(explicit)))
 
     @property
     def min_age_s(self) -> float:

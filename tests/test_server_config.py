@@ -67,3 +67,18 @@ def test_blocked_transcript_folder_is_explained(cfg, monkeypatch):
     assert any("Files and Folders" in w for w in status["warnings"])
     out = _call(build_server(tools), "voicememos_read", {"memo": "aaaa1111"})
     assert "Files and Folders" in out and "Error executing tool" not in out
+
+
+def test_launchd_timer_follows_the_poll_interval(cfg, tmp_path):
+    assert cfg.poll_interval_s == 1800
+    assert "<key>StartInterval</key><integer>1800</integer>" in launchd_plist(cfg, ["/x"])
+    empty = tmp_path / "none.env"
+    empty.write_text("", encoding="utf-8")
+    plaud = load_config(path=empty, env={"VOICEMEMOS_PLAUD": "1"})  # Plaud's cloud can only be asked
+    assert plaud.poll_interval_s == 60
+    assert "<key>StartInterval</key><integer>60</integer>" in launchd_plist(plaud, ["/x"])
+    fast = load_config(path=empty, env={"VOICEMEMOS_PLAUD": "1", "VOICEMEMOS_POLL_INTERVAL_S": "5"})
+    assert fast.poll_interval_s == 30
+    plist = launchd_plist(fast, ["/x"])
+    assert "<key>StartInterval</key><integer>30</integer>" in plist
+    assert "<key>ThrottleInterval</key><integer>30</integer>" in plist

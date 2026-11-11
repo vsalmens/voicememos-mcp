@@ -199,6 +199,7 @@ def cmd_check(_args) -> int:
     if cfg.flag("VOICEMEMOS_PLAUD"):
         tokens = cfg.plaud_tokens_path
         print(f"Plaud:          on, login {'found' if tokens.exists() else 'MISSING: run `plaud login`'} ({tokens})")
+    print(f"timed run:      every {cfg.poll_interval_s} s (applied by ./install.sh)")
     print(f"data dir:       {cfg.data_dir}")
     print(f"output dir:     {cfg.output_dir}")
     key = cfg.secret("SONIOX_API_KEY")
@@ -255,15 +256,16 @@ def launchd_plist(cfg, program: list[str]) -> str:
     watch = "".join(f"<string>{escape(str(p))}</string>"
                     for p in (cfg.recordings_dir, cfg.data_dir / "queue", cfg.import_dir))
     path_env = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    interval = cfg.poll_interval_s
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>{escape(cfg.get('VOICEMEMOS_LAUNCHD_LABEL'))}</string>
   <key>ProgramArguments</key><array>{args}</array>
   <key>WatchPaths</key><array>{watch}</array>
-  <key>StartInterval</key><integer>1800</integer>
+  <key>StartInterval</key><integer>{interval}</integer>
   <key>RunAtLoad</key><true/>
-  <key>ThrottleInterval</key><integer>60</integer>
+  <key>ThrottleInterval</key><integer>{min(60, interval)}</integer>
   <key>ProcessType</key><string>Background</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path_env}</string></dict>
   <key>StandardOutPath</key><string>{escape(str(logs / 'worker.log'))}</string>
