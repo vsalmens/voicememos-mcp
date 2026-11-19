@@ -308,6 +308,32 @@ After such rule changes, `voicememos-mcp second-read --realign --queue` (or
 `voicememos_second_read(since="2000-01-01", realign=True)`) aligns the stored readings again
 with the current rules. No audio is sent and no API is called.
 
+### Trying another model as the second reader
+
+Marking a listening checklist (`better: A` / `B` / `both` in a `second-reader_*.md` report)
+gives ground truth for those spots. Other models can then be scored against it without
+touching the transcripts:
+
+```
+voicememos-mcp second-read --candidate --model gemini-4-neon --memo ce5d4a78 --memo 7a74f00f
+voicememos-mcp second-read --candidate --model gemini-3.5-transcribe --memo ce5d4a78 --memo 7a74f00f
+voicememos-mcp score-readers ~/…/_reports/second-reader_2026-10-14_1947.md --out ~/Documents/reader-score.md
+```
+
+A candidate reading is stored in the transcript JSON as a reader with role `candidate` (one
+per model); the words, the marks and the active second reader stay as they are.
+`score-readers` finds each marked spot in every reading by the words around it and counts
+how often a reading says what the listener heard. Words are compared as written apart from
+case and punctuation, so spoken forms count: `nään` is not `näen`. Spots marked `neither`
+or left unmarked are not scored. The current primary transcript is scored too, so a newer
+primary engine shows up as well.
+
+`gemini-3.5-transcribe` is Google's speech-to-text model, called through the Interactions
+API in verbatim mode with the configured languages and `VOICEMEMOS_CONTEXT_TERMS` as custom
+vocabulary (without word timestamps or diarization, which the documentation says reduce
+accuracy). If the API refuses more than one language code, the request is repeated with the
+model's own language detection. Files up to an hour.
+
 Transcripts start with a short reading guide that asks language models not to present
 marked words as certain, and to propose corrections visibly (`word→suggestion (?)`).
 

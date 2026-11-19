@@ -143,3 +143,86 @@ class Gemini:
             log.warning("Gemini finished with %s; the transcript may be incomplete", finish)
         return {"text": text, "model": response.get("modelVersion", self.model),
                 "usage": response.get("usageMetadata", {}), "finish_reason": finish}
+
+
+# ----------------------------------------------------------------------------- Gemini 3.5 Transcribe
+#
+# A speech-to-text model (not a general model): it takes no prompt but a transcription
+# config, and is called through the Interactions API. Verbatim mode, no timestamps, no
+# diarization (those reduce accuracy and rule out the custom vocabulary). Audio always goes
+# through the Files API, as the documentation recommends for anything but a few seconds.
+
+BCP47 = {"fi": "fi-FI", "en": "en-US", "sv": "sv-SE", "de": "de-DE", "fr": "fr-FR", "es": "es-ES",
+         "it": "it-IT", "et": "et-EE", "ru": "ru-RU"}
+
+
+def is_transcribe_model(model: str | None) -> bool:
+    return bool(model) and "transcribe" in model
+
+
+def interaction_text(response: dict) -> str:
+    """The transcript from an Interactions API response (text items of model_output steps)."""
+    if isinstance(response.get("output_text"), str):
+        return response["output_text"].strip()
+    texts = []
+    for step in response.get("steps") or response.get("outputs") or []:
+        if step.get("type") not in (None, "model_output"):
+            continue
+        for item in step.get("content") or ([step] if step.get("text") else []):
+            if item.get("type", "text") == "text" and item.get("text"):
+                texts.append(item["text"])
+    return "\n".join(texts).strip()
+
+
+class GeminiTranscribe(Gemini):
+    def __init__(self, api_key: str, model: str = "gemini-3.5-transcribe", languages: list[str] | None = None,
+                 vocabulary: list[str] | None = None, **kwargs):
+        super().__init__(api_key, model, **kwargs)
+        self.languages = [BCP47.get(code, code) for code in (languages or [])]
+        self.vocabulary = [t for t in (vocabulary or []) if t][:1000]
+
+    def _body(self, file: dict, mime: str, languages: list[str]) -> dict:
+        config: dict = {"mode": {"type": "verbatim"}}
+        if languages:
+            config["language_codes"] = languages
+        if self.vocabulary:
+            config["custom_vocabulary"] = self.vocabulary
+        return {"model": self.model,
+                "input": [{"type": "audio", "uri": file["uri"], "mime_type": file.get("mimeType", mime)}],
+                "generation_config": {"transcription_config": config}}
+
+    def _wait(self, response: dict) -> dict:
+        for _ in range(int(self.timeout // 5)):
+            if response.get("status") in (None, "completed", "COMPLETED"):
+                return response
+            if str(response.get("status")).lower() in ("failed", "cancelled", "error"):
+                raise GeminiError(f"Gemini transcribe {response.get('status')}: {str(response.get('error'))[:300]}")
+            time.sleep(5)
+            response = self.session.get(f"{API}/v1beta/{response['id']}", timeout=60).json()
+        raise GeminiError("Gemini transcribe: no result in time")
+
+    def transcribe(self, audio: Path, prompt: str = "") -> dict:  # noqa: ARG002 - the model takes no prompt
+        mime = mimetypes.guess_type(audio.name)[0] or "audio/mp4"
+        if audio.suffix.lower() == ".m4a":
+            mime = "audio/mp4"
+        uploaded = self._upload(audio, mime)
+        try:
+            try:
+                response = self._post(f"{API}/v1beta/interactions", json=self._body(uploaded, mime, self.languages),
+                                      timeout=self.timeout).json()
+            except GeminiError as exc:
+                if not (self.languages and " 400" in f" {exc}"[:12]):
+                    raise
+                # more than one language code may be refused: fall back to the model's own detection
+                log.warning("Gemini transcribe refused the language codes, retrying with detection: %s", exc)
+                response = self._post(f"{API}/v1beta/interactions", json=self._body(uploaded, mime, []),
+                                      timeout=self.timeout).json()
+            response = self._wait(response)
+        finally:
+            if uploaded.get("name"):
+                self._delete(uploaded["name"])
+        text = interaction_text(response)
+        if not text:
+            raise GeminiError(f"Gemini transcribe returned no text: {str(response)[:300]}")
+        return {"text": text, "model": response.get("model", self.model), "usage": response.get("usage", {}),
+                "finish_reason": "STOP"}
