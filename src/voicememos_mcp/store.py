@@ -76,6 +76,21 @@ def write_json_atomic(path: Path, data, keep_backup: bool = False) -> None:
         Path(tmp).unlink(missing_ok=True)
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    """Like ``write_json_atomic`` for a text file: a reader never sees half of it, and a run cut
+    short leaves the file as it was."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
 def write_json_if_changed(path: Path, data, ignore: tuple[str, ...] = ()) -> bool:
     """Write only when the content differs from the file (top-level keys in ``ignore`` aside).
     The worker runs every minute; a snapshot that says the same thing is not written again."""
@@ -178,6 +193,26 @@ class Store:
     def write_state(self, state: dict) -> None:
         write_json_atomic(self.state_path, state, keep_backup=True)
 
+    # ---- ranges taken out of recordings (redact.py)
+    @property
+    def redactions_path(self) -> Path:
+        return self.data_dir / "redactions.json"
+
+    def read_redactions(self) -> dict:
+        """``{memo id: [{"start_ms", "end_ms", "date", "state"}]}``: the ranges the user had taken out.
+        Bounds and a day only. Never removed: everything that writes a transcript or reads the
+        audio honours it, a range whose removal has only begun included."""
+        data = read_json(self.redactions_path, {})
+        memos = data.get("memos") if isinstance(data, dict) else None
+        return memos if isinstance(memos, dict) else {}
+
+    def redactions_for(self, memo_id: str | None) -> list[dict]:
+        found = self.read_redactions().get(str(memo_id or ""))
+        return sorted((r for r in found or [] if isinstance(r, dict)), key=lambda r: r["start_ms"])
+
+    def write_redactions(self, memos: dict) -> None:
+        write_json_atomic(self.redactions_path, {"memos": memos, "updated": now_iso()})
+
     @property
     def usage_path(self) -> Path:
         return self.data_dir / "usage.json"
@@ -259,6 +294,19 @@ class Store:
         """
         base = self.transcript_base(memo)
         base.parent.mkdir(parents=True, exist_ok=True)
+        # A range the user had taken out stays out of a new transcription: its words and raw tokens
+        # are dropped before anything is written (the audio is silent there, but an engine may
+        # still hear words in silence), and its line is rendered in its place.
+        redactions = [{k: r[k] for k in ("start_ms", "end_ms", "date")} for r in self.redactions_for(memo.get("id"))]
+        if redactions:
+            def out(item: dict) -> bool:
+                at = item.get("start_ms")
+                return at is not None and any(r["start_ms"] <= at < r["end_ms"] for r in redactions)
+
+            words = [w for w in words if not out(w)]
+            if source_tokens is not None:
+                source_tokens = [t for t in source_tokens if not out(t)]
+            extra = {**(extra or {}), "redactions": redactions}
         speakers = (extra or {}).get("speakers")
         text = "\n\n".join(notation.render_blocks(words, threshold, run_min, pause_ms, speakers))
         data = {
@@ -282,7 +330,7 @@ class Store:
             if old.with_suffix("") != base and old.suffix in (".md", ".json"):
                 old.unlink(missing_ok=True)
         write_json_atomic(json_path, data)
-        md_path.write_text(render_markdown(data, threshold, run_min, pause_ms, self.stamp_every_s), encoding="utf-8")
+        write_text_atomic(md_path, render_markdown(data, threshold, run_min, pause_ms, self.stamp_every_s))
         return {
             "json": self._stored(json_path),
             "markdown": self._stored(md_path),
@@ -303,8 +351,7 @@ class Store:
         data["words"] = notation.annotate(words, threshold)
         data["updated"] = now_iso()
         write_json_atomic(json_path, data)
-        json_path.with_suffix(".md").write_text(render_markdown(data, threshold, run_min, pause_ms, self.stamp_every_s),
-                                                encoding="utf-8")
+        write_text_atomic(json_path.with_suffix(".md"), render_markdown(data, threshold, run_min, pause_ms, self.stamp_every_s))
         return {"json": relative_json, "markdown": str(Path(relative_json).with_suffix(".md")),
                 "stats": data["stats"], "markers": data["markers"]}
 
@@ -387,7 +434,8 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
     memo = data["memo"]
     words = data.get("words", [])
     s = notation.stats(words, threshold)
-    blocks = notation.render_blocks(words, threshold, run_min, pause_ms, data.get("speakers"), stamp_every_s)
+    blocks = notation.render_blocks(words, threshold, run_min, pause_ms, data.get("speakers"), stamp_every_s,
+                                    data.get("redactions"))
     text = "\n\n".join(blocks)
     markers = data.get("markers", [])
     title = memo.get("title") or "Voice memo"

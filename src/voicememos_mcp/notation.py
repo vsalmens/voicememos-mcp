@@ -217,8 +217,20 @@ def speaker_labels(words: list[dict]) -> dict:
             for number, spk in enumerate(order, start=1)}
 
 
+def redaction_line(redaction: dict) -> str:
+    """The one line that stands in a transcript where a range was taken out (``redact.py``): the day and
+    the bounds, never a reason or a word of what was there. Readers downstream match it exactly."""
+    def at(ms: int) -> str:
+        sec = int(ms // 1000)
+        h, m, s = sec // 3600, sec % 3600 // 60, sec % 60
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    y, m, d = (int(x) for x in str(redaction["date"])[:10].split("-"))
+    return f"[poistettu {d}.{m}.{y}: {at(redaction['start_ms'])}–{at(redaction['end_ms'])}]"
+
+
 def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_ms: int = 2500,
-                  speakers: dict | None = None, stamp_every_s: int = 0) -> list[str]:
+                  speakers: dict | None = None, stamp_every_s: int = 0, redactions: list[dict] | None = None) -> list[str]:
     """Render words to paragraphs.
 
     A pause longer than ``pause_ms`` starts a new paragraph. With ``speakers`` (from
@@ -226,11 +238,29 @@ def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_m
     With ``stamp_every_s``, a paragraph that starts at least that long after the previous
     time stamp gets its time (``[mm:ss]``, or ``[h:mm:ss]`` in recordings of an hour or more).
     Runs of the same word (``REPEAT_MIN`` or more) are collapsed to ``[?: word ×N]``.
+    With ``redactions`` (ranges taken out of the recording), each range's line stands as a
+    paragraph of its own where the range was; see ``layout``.
     """
+    return layout(words, threshold, run_min, pause_ms, speakers, stamp_every_s, redactions)["lines"]
+
+
+def layout(words: list[dict], threshold: float, run_min: int = 4, pause_ms: int = 2500,
+           speakers: dict | None = None, stamp_every_s: int = 0, redactions: list[dict] | None = None) -> dict:
+    """``render_blocks`` with what it decided: ``lines`` (the paragraphs), and for each of them
+    ``starts`` (its first word's time, None for a redaction's line), ``stamped`` and
+    ``stamp_before`` (the time of the last stamp before it).
+
+    A redaction's line ends the paragraph before it, and the paragraph after it names its speaker
+    again. A redaction may carry ``resume``, written when the range was taken out, so that the
+    paragraphs after it are stamped exactly as they were: ``stamp_last_ms`` is the time of the last
+    stamp as it was where the range ended, and ``block_start`` false says the first paragraph after
+    the range is the rest of a paragraph that began inside it (it gets no stamp of its own)."""
     speakers = speakers or {}
     blocks: list[list[str]] = [[]]
     prefixes: list[str] = [""]
     starts: list[int | None] = [None]
+    marks: dict[int, dict] = {}  # block index -> the redaction whose line it is
+    pending = sorted((r for r in redactions or [] if isinstance(r, dict)), key=lambda r: r["start_ms"])
     current = None
     loops = repetition_runs(words)
 
@@ -238,9 +268,29 @@ def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_m
         spk = word.get("speaker")
         return str(spk) if spk not in (None, "") and str(spk) in speakers else None
 
+    def mark() -> None:
+        nonlocal current
+        redaction = pending.pop(0)
+        if blocks[-1]:
+            blocks.append([])
+            prefixes.append("")
+            starts.append(None)
+        marks[len(blocks) - 1] = redaction
+        blocks[-1].append(redaction_line(redaction))
+        prefixes[-1] = ""
+        blocks.append([])
+        prefixes.append("")
+        starts.append(None)
+        current = None
+
+    def crosses(k: int) -> bool:
+        return bool(pending) and words[k].get("start_ms") is not None and words[k]["start_ms"] >= pending[0]["start_ms"]
+
     i, n = 0, len(words)
     while i < n:
         word = words[i]
+        while crosses(i):
+            mark()
         spk = speaker_of(word)
         if spk is not None and spk != current:
             if blocks[-1]:
@@ -277,7 +327,8 @@ def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_m
             j = i
             while (j < n and _is_uncertain(words[j], threshold)
                    and not words[j].get("insert_after") and not words[j].get("insert_before")
-                   and (j == i or speaker_of(words[j]) in (None, spk)) and (j == i or j not in loops)):
+                   and (j == i or speaker_of(words[j]) in (None, spk)) and (j == i or j not in loops)
+                   and (j == i or not crosses(j))):
                 j += 1
             run = words[i:j]
             if len(run) >= run_min:
@@ -290,15 +341,34 @@ def render_blocks(words: list[dict], threshold: float, run_min: int = 4, pause_m
             continue
         blocks[-1].append(_with_inserts(word, render_word(word, threshold)))
         i += 1
+    while pending:  # ranges after the last word
+        mark()
     stamps = [""] * len(blocks)
+    before = [0] * len(blocks)
     if stamp_every_s and words:
-        long_form = (words[-1].get("end_ms") or 0) >= 3_600_000
-        last = 0
+        ends = [w.get("end_ms") or 0 for w in words[-1:]] + [r.get("end_ms") or 0 for r in redactions or []]
+        long_form = max(ends) >= 3_600_000  # a range taken out at the end does not change the clock's form
+        last, tail = 0, False
         for k, start in enumerate(starts):
-            if start is not None and blocks[k] and start - last >= stamp_every_s * 1000:
+            before[k] = last
+            if k in marks:
+                resume = marks[k].get("resume") or {}
+                if resume.get("stamp_last_ms") is not None:
+                    last = resume["stamp_last_ms"]
+                tail = resume.get("block_start") is False
+                continue
+            if not blocks[k]:
+                continue
+            if tail:
+                tail = False
+                continue
+            if start is not None and start - last >= stamp_every_s * 1000:
                 stamps[k] = _clock(start, long_form) + " "
                 last = start
-    return [stamp + prefix + " ".join(b) for stamp, prefix, b in zip(stamps, prefixes, blocks) if b]
+    keep = [k for k, b in enumerate(blocks) if b]
+    return {"lines": [stamps[k] + prefixes[k] + " ".join(blocks[k]) for k in keep],
+            "starts": [starts[k] for k in keep], "stamped": [bool(stamps[k]) for k in keep],
+            "stamp_before": [before[k] for k in keep], "redaction": [k in marks for k in keep]}
 
 
 def stats(words: list[dict], threshold: float) -> dict:

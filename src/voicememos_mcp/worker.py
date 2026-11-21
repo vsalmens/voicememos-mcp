@@ -757,8 +757,17 @@ class Worker:
             return {**item, "status": "not_downloaded",
                     "error": "audio is still in iCloud; play the memo once in Voice Memos on this Mac"}
         path = self._audio_path(memo)
-        fingerprint = _fingerprint(path)
         entry = self.state.get(memo.id, {})
+        if not dry_run:
+            # A range the user had taken out is silent before anything reads the audio, also in a
+            # file that was fetched again. When that changed the file and nothing else did, the
+            # transcript made of the earlier file stands.
+            from . import redact
+
+            before = _fingerprint(path)
+            if redact.ensure_audio(self.store, memo.id, path) and entry.get("ok") and not _changed(entry.get("fp"), before):
+                entry["fp"] = _fingerprint(path)
+        fingerprint = _fingerprint(path)
         self._fp_cache[memo.id] = fingerprint
         if not force and entry.get("ok") and not _changed(entry.get("fp"), fingerprint):
             return {**item, "status": "already_transcribed", "markdown": entry.get("markdown")}
@@ -1314,6 +1323,9 @@ class Worker:
         summary: dict = {"ok": True, "started": started, "library_readable": True, "memos": len(memos),
                          "jobs": [], "transcribed": [], "failed": [], "skipped": []}
         if not dry_run:
+            from . import redact
+
+            redact.ensure_library(self.store, self.state, memos, self._audio_path)  # ranges taken out stay silent
             moved = sum(self.store.relocate(m.to_dict(), self.state[m.id]) for m in memos
                         if self.state.get(m.id, {}).get("ok"))
             if moved:

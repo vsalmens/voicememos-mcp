@@ -466,7 +466,39 @@ voicememos-mcp second-read --since 2026-01-01 --limit 20   # add the second read
 voicememos-mcp report                        # compare readers per language
 voicememos-mcp voiceprint status             # enrollment state and suggestions
 voicememos-mcp launchd-plist                 # print the launchd job definition
+voicememos-mcp redact plan --memo ID --from-ms 6795000 --to-ms 7137000   # see below
 ```
+
+### Taking a stretch out of a recording
+
+When a recording caught something that must not be kept and the rest should stay, `redact` removes one
+range of time from every form of it: the audio becomes silent there (in place: the recording is as long as
+before and every other time stamp still fits), the range's words and the engine's raw tokens leave the
+JSON, the markers found there go, and the transcript gets one line in the range's place,
+`[poistettu 21.11.2026: 1:53:15–1:58:57]` (the day and the bounds, no reason, no content).
+
+```bash
+voicememos-mcp redact plan   --memo ID --from-ms A --to-ms B     # changes nothing: the bounds, counts, lines
+voicememos-mcp redact apply  --memo ID --start-ms A --end-ms B --date 2026-11-21 --yes
+voicememos-mcp redact verify --memo ID                           # is every range still out (numbers only)
+voicememos-mcp redact list
+```
+
+- `plan` moves the asked bounds outward onto word boundaries and answers with them; `apply` takes exactly
+  those. It also shows the three words before and after the range (outside it), so the bounds can be
+  checked without reading what is between.
+- Only Ogg Opus audio in the import folder can be silenced (a Plaud recorder's files, an imported one). A
+  recording in Apple's Voice Memos library is never edited, and `apply` refuses rather than take a range
+  out of the text while the sound keeps it.
+- `DATA_DIR/redactions.json` records the ranges and is never cleared. A transcription from scratch drops
+  the range again and renders its line, every re-rendering keeps the line, and a file that is fetched
+  again is silenced before anything reads it.
+- A run cut short is finished by running the same command again; a second run changes nothing. No copy of
+  the original is left by the command.
+- Not reached: the recorder's own app and cloud, backups and snapshots, what the speech engines logged,
+  and a block already pushed to Roam (the command says when there is one).
+- Each call prints one JSON object. An error is `{"error": ...}` with exit status 2 and never quotes a
+  recording. Indexes built on the transcripts (Vipu) call this command and do their own part around it.
 
 ## Calibrating the threshold
 

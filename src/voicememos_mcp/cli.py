@@ -227,6 +227,46 @@ def cmd_voiceprint(args) -> int:
     return 0
 
 
+def cmd_redact(args) -> int:
+    """Take a stretch of time out of one recording (``redact.py``). One JSON object on stdout; an error is
+    ``{"error": ...}`` with exit status 2, and never quotes a recording."""
+    from . import redact
+    from .store import StateError, Store
+
+    cfg = load_config()
+    store = Store(cfg.data_dir, cfg.output_dir, cfg.folder_dirs)
+    store.stamp_every_s = cfg.timestamp_every_s
+
+    def need(*names: str) -> list[int]:
+        missing = [n for n in names if getattr(args, n) is None]
+        if missing or (args.action != "list" and not args.memo):
+            raise redact.RedactError(f"redact {args.action} needs --memo and " + ", ".join("--" + n.replace("_", "-") for n in names))
+        return [getattr(args, n) for n in names]
+
+    try:
+        if args.action == "plan":
+            out = redact.plan(cfg, store, args.memo, *need("from_ms", "to_ms"))
+        elif args.action == "apply":
+            bounds = need("start_ms", "end_ms")
+            if not args.yes:
+                raise redact.RedactError("apply changes the recording for good and needs --yes")
+            out = redact.apply(cfg, store, args.memo, *bounds, args.date or dt.date.today().isoformat())
+        elif args.action == "verify":
+            need()
+            out = redact.verify(cfg, store, args.memo)
+        else:
+            out = redact.listing(store)
+    except (redact.RedactError, StateError) as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+        return 2
+    except Exception as exc:  # noqa: BLE001 - the contract: one JSON object, and no content in an error
+        print(json.dumps({"error": f"{type(exc).__name__} (see the log); run the same command again"}))
+        logging.getLogger(__name__).error("redact %s failed: %s", args.action, type(exc).__name__)
+        return 2
+    print(json.dumps(out, ensure_ascii=False, indent=None if args.json else 1))
+    return 0 if out.get("ok", True) else 1
+
+
 def cmd_check(_args) -> int:
     cfg = load_config()
     ok = True
@@ -423,6 +463,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true", help="only count what would be fetched")
     p.add_argument("--limit", type=int, help="fetch at most this many recordings")
 
+    p = sub.add_parser("redact", help="take a stretch of time out of one recording for good: audio, transcript "
+                                      "and data (plan changes nothing; apply needs --yes)")
+    p.add_argument("action", choices=["plan", "apply", "verify", "list"])
+    p.add_argument("--memo", help="memo id (the transcript's memo_id)")
+    p.add_argument("--from-ms", type=int, help="plan: where the range starts, ms from the recording's start")
+    p.add_argument("--to-ms", type=int, help="plan: where it ends")
+    p.add_argument("--start-ms", type=int, help="apply: the start plan answered with")
+    p.add_argument("--end-ms", type=int, help="apply: the end plan answered with")
+    p.add_argument("--date", help="apply: the day written on the range's line, YYYY-MM-DD (default today)")
+    p.add_argument("--yes", action="store_true", help="apply: really change the files")
+    p.add_argument("--json", action="store_true", help="one line of JSON")
+
     p = sub.add_parser("transcribe-file", help="transcribe one audio file and print it (nothing saved)")
     p.add_argument("file")
     p.add_argument("--threshold", type=float, action="append", help="render with this threshold (repeatable)")
@@ -440,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {None: cmd_serve, "serve": cmd_serve, "sync": cmd_sync, "check": cmd_check,
                 "transcribe-file": cmd_transcribe_file, "launchd-plist": cmd_launchd_plist,
                 "second-read": cmd_second_read, "report": cmd_report, "voiceprint": cmd_voiceprint,
-                "import": cmd_import, "plaud": cmd_plaud}
+                "import": cmd_import, "plaud": cmd_plaud, "redact": cmd_redact}
     return handlers[args.command](args)
 
 
