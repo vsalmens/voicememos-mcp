@@ -109,6 +109,8 @@ class _Page:
     serial: int
     seq: int
     entries: list[_Entry]
+    raw: bytes = b""  # the page as it is in the file
+    foreign: bool = False  # a page of another stream in the same file: written back byte for byte
 
 
 def _read_pages(data: bytes) -> list[_Page]:
@@ -139,12 +141,28 @@ def _read_pages(data: bytes) -> list[_Page]:
                 j += 1
             entries.append(_Entry(body[o:o + length], bytes(lacing[i:j]), -1 if ends else None))
             o, i = o + length, j
-        pages.append(_Page(flags, granule, serial, seq, entries))
+        pages.append(_Page(flags, granule, serial, seq, entries, raw))
         at = end
     if not pages:
         raise OpusError("an empty file")
-    if len({p.serial for p in pages}) != 1:
-        raise OpusError("more than one stream in the file (a chained or multiplexed Ogg): not edited")
+    return _own_stream(pages)
+
+
+def _own_stream(pages: list[_Page]) -> list[_Page]:
+    """Mark the pages that are not the Opus stream's. Some recorders write a second stream beside the audio
+    (a Plaud recorder: one page of zeros for each page of sound). Such pages are never changed; a second
+    stream that holds data is refused, because what it holds of the range is not known."""
+    starts = [p for p in pages if p.flags & 2]
+    opus_starts = [p for p in starts if p.entries and p.entries[0].data.startswith(b"OpusHead")]
+    if len(opus_starts) != 1 or len({p.serial for p in starts}) != len(starts):
+        raise OpusError("not one Opus stream in the file (a chained Ogg, or none): not edited")
+    own = opus_starts[0].serial
+    for page in pages:
+        if page.serial == own:
+            continue
+        page.foreign = True
+        if not page.flags & 2 and any(e.data.strip(b"\0") for e in page.entries):
+            raise OpusError("a second stream in the file holds data: not edited")
     return pages
 
 
@@ -153,6 +171,8 @@ def _packets(pages: list[_Page]) -> list[tuple[bytes, list[tuple[int, int]]]]:
     out: list[tuple[bytes, list[tuple[int, int]]]] = []
     parts: list[tuple[int, int]] = []
     for p, page in enumerate(pages):
+        if page.foreign:
+            continue
         for e, entry in enumerate(page.entries):
             parts.append((p, e))
             if entry.packet is not None:
@@ -170,7 +190,12 @@ def _lacing(length: int) -> bytes:
 
 def _write_pages(pages: list[_Page]) -> bytes:
     out = []
-    for seq, page in enumerate(pages):
+    seq = -1
+    for page in pages:
+        if page.foreign:
+            out.append(page.raw)
+            continue
+        seq += 1
         lacing = b"".join(e.lacing for e in page.entries)
         if len(lacing) > 255:
             raise OpusError("a page would hold more than 255 segments")
@@ -204,8 +229,8 @@ def info(path: Path) -> dict:
     """Length and packet counts, read from the packets themselves (no decoder)."""
     pages, packets, pre_skip = _open(path)
     total = sum(samples_of(p) for p, _ in packets[2:])
-    last = max((p.granule for p in pages if p.granule >= 0), default=0)
-    return {"pages": len(pages), "packets": len(packets) - 2, "pre_skip": pre_skip, "bytes": Path(path).stat().st_size,
+    last = max((p.granule for p in pages if p.granule >= 0 and not p.foreign), default=0)
+    return {"pages": len(pages), "other_stream_pages": sum(1 for p in pages if p.foreign), "packets": len(packets) - 2, "pre_skip": pre_skip, "bytes": Path(path).stat().st_size,
             "duration_ms": round(max(0, (last or total) - pre_skip) * 1000 / RATE),
             "silent_packets": sum(1 for p, _ in packets[2:] if is_silent(p))}
 
@@ -247,7 +272,7 @@ def silence(source: Path, target: Path, start_ms: float, end_ms: float) -> dict:
             pages[a].flags &= ~1  # the page no longer starts with the rest of a packet
     for page in pages:
         page.entries = [e for e in page.entries if e.lacing]
-    kept = [p for p in pages if p.entries or p.flags & 6]  # never drop the first or the last page of the stream
+    kept = [p for p in pages if p.foreign or p.entries or p.flags & 6]  # never drop the first or the last page of the stream
     Path(target).write_bytes(_write_pages(kept))
     return {"packets": len(packets) - 2, "silenced": replaced, "already_silent": already,
             "audio_from_ms": None if first is None else round(first), "audio_to_ms": None if last is None else round(last)}
@@ -268,6 +293,8 @@ def check(source: Path, target: Path, start_ms: float, end_ms: float) -> dict:
     pages, after, skip_after = _open(target)
     if len(before) != len(after) or skip_before != skip_after or before[0][0] != after[0][0] or before[1][0] != after[1][0]:
         raise OpusError("the silenced file does not have the source's packets")
+    if [p.raw for p in _read_pages(Path(source).read_bytes()) if p.foreign] != [p.raw for p in pages if p.foreign]:
+        raise OpusError("a page of the file's other stream changed")
     spans = _spans(before, skip_before)
     inside = same = 0
     for (begin, end), (old, _), (new, _) in zip(spans, before[2:], after[2:]):
@@ -313,7 +340,7 @@ def decoded_check(source: Path, target: Path, start_ms: float, end_ms: float, ra
         return {"decoded": False, "why": "no ffmpeg on this host"}
 
     def stream(path: Path):
-        return subprocess.Popen([tool, "-nostdin", "-loglevel", "error", "-i", str(path), "-f", "s16le", "-ac", "1", "-ar", str(rate), "-"],
+        return subprocess.Popen([tool, "-nostdin", "-loglevel", "error", "-i", str(path), "-map", "0:a:0", "-f", "s16le", "-ac", "1", "-ar", str(rate), "-"],
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     a, b = stream(source), stream(target)
@@ -345,8 +372,10 @@ def decoded_check(source: Path, target: Path, start_ms: float, end_ms: float, ra
         for p in (a, b):
             p.stdout.close()
             p.wait()
-    if a.returncode or b.returncode:
-        raise OpusError("ffmpeg could not decode the recording")
+    if a.returncode or not count_a:  # the original itself is not something this ffmpeg reads: nothing to compare
+        return {"decoded": False, "why": "ffmpeg could not decode the original"}
+    if b.returncode:
+        raise OpusError("ffmpeg decodes the original but not the silenced file")
 
     def rms(acc) -> float | None:
         return round(float((acc[0] / acc[1]) ** 0.5), 2) if acc[1] else None

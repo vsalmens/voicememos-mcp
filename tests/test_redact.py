@@ -95,9 +95,8 @@ def test_plan_moves_the_bounds_to_word_boundaries_and_changes_nothing(env):
     plan = redact.plan(env.cfg, env.store, env.memo, FROM_MS, TO_MS)
     assert (plan["start_ms"], plan["end_ms"]) == (START_MS, END_MS) and not plan["whole"] and not plan["already"]
     assert plan["words"] == 7 + 10 + 4 and plan["words_total"] == 90 and plan["source_tokens"] == 21 and plan["duration_ms"] == SECONDS * 1000
-    assert plan["edge"] == {"before": ["kivikatu", "kivipelto", "kivisilta"], "after": ["vesiranta", "vesipolku", f"{SECRET}"]} or \
-        plan["edge"]["before"] == [f"{STEMS[3]}{e}" for e in ENDS[:3]]
-    assert plan["edge"]["after"] == ["vesiranta", "vesipolku", SECRET]  # outside the range: this one stays, by the bounds asked
+    assert plan["edge"]["after"][:3] == ["vesiranta", "vesipolku", SECRET] and len(plan["edge"]["after"]) == 12  # outside: stays
+    assert plan["edge"]["before"][-3:] == ["sumukatu", "sumupelto", "sumusilta"] and len(plan["edge"]["before"]) == 12
     lines = env.md.read_text().split("\n")
     top = lines.index("## Transcript")  # above it the line with the word count changes too, and is named
     assert [i for i in plan["transcript"]["lines_cut"] if i < top] == [next(i for i, x in enumerate(lines) if "90 words" in x)]
@@ -198,6 +197,67 @@ def test_the_range_does_not_come_back(env):
     assert redact.verify(env.cfg, env.store, env.memo)["ok"]
 
 
+def beside_a_second_stream(path: Path) -> int:
+    """Rewrite the file the way a Plaud recorder writes it: after each page of sound a page of another stream
+    (its first one named, the rest 23 zero bytes). Returns how many such pages were added."""
+    import struct
+
+    def page(flags: int, granule: int, seq: int, body: bytes) -> bytes:
+        head = b"OggS" + struct.pack("<BBqIIIB", 0, flags, granule, 777, seq, 0, 1) + bytes([len(body)])
+        return head[:22] + struct.pack("<I", opus._crc(head + body)) + head[26:] + body
+
+    out, n = [], 0
+    for p in opus._read_pages(path.read_bytes()):
+        out.append(p.raw)
+        out.append(page(2 if n == 0 else 0, max(p.granule, 0), n, b"PLAUD.AI" + b"\0" * 15 if n == 0 else b"\0" * 23))
+        n += 1
+    stamp = path.stat().st_mtime
+    path.write_bytes(b"".join(out))
+    os.utime(path, (stamp, stamp))
+    return n
+
+
+def test_a_recorders_file_with_a_second_stream_of_zeros(env):
+    plain = opus.info(env.audio)
+    added = beside_a_second_stream(env.audio)
+    env.store.write_state({**env.store.read_state(), env.memo: {**env.store.read_state()[env.memo], "fp": redact._fingerprint(env.audio)}})
+    foreign = [p.raw for p in opus._read_pages(env.audio.read_bytes()) if p.foreign]
+    info = opus.info(env.audio)
+    assert len(foreign) == added == info["other_stream_pages"] and info["duration_ms"] == plain["duration_ms"] and info["packets"] == plain["packets"]
+    plan = redact.plan(env.cfg, env.store, env.memo, 30_000, 59_000)
+    assert plan["audio"]["supported"]
+    done = apply(env, plan["start_ms"], plan["end_ms"])
+    assert done["audio"]["silenced"] > 1000 and done["audio"]["duration_diff_ms"] < 50
+    heard = done["audio"]["heard"]
+    assert heard["decoded"] and heard["rms_in_range"] <= opus.QUIET_RMS and heard["rms_outside_after"] > 1000
+    assert [p.raw for p in opus._read_pages(env.audio.read_bytes()) if p.foreign] == foreign  # not a byte of the other stream
+    assert redact.verify(env.cfg, env.store, env.memo)["ok"] and files_with(env) == []
+    assert apply(env, plan["start_ms"], plan["end_ms"])["already"]
+
+
+def test_a_second_stream_that_holds_data_is_refused(env):
+    beside_a_second_stream(env.audio)
+    raw = bytearray(env.audio.read_bytes())
+    at = raw.rindex(b"OggS", 0, raw.rindex(b"OggS"))  # the last but one page is the other stream's? find one of serial 777
+    pages = opus._read_pages(bytes(raw))
+    offset = 0
+    for p in pages:
+        if p.foreign and not p.flags & 2:
+            body_at = offset + len(p.raw) - 1
+            raw[body_at] = 7
+            fixed = bytes(raw[offset:offset + len(p.raw)])
+            raw[offset + 22:offset + 26] = __import__("struct").pack("<I", opus._crc(fixed[:22] + b"\0\0\0\0" + fixed[26:]))
+            break
+        offset += len(p.raw)
+    assert at >= 0
+    env.audio.write_bytes(bytes(raw))
+    plan = redact.plan(env.cfg, env.store, env.memo, 30_000, 59_000)
+    assert not plan["audio"]["supported"] and "second stream" in plan["audio"]["problem"]
+    with pytest.raises(redact.RedactError, match="nothing was changed"):
+        apply(env, plan["start_ms"], plan["end_ms"])
+    assert not env.store.redactions_path.exists()
+
+
 @pytest.mark.parametrize("from_ms, to_ms, bounds, words", [
     (0, 4_000, (0, 4_000), 8),  # at the start
     (84_100, 10**7, (83_800, SECONDS * 1000), 2),  # to the end, the asked end past the recording
@@ -243,14 +303,17 @@ def test_an_apply_cut_short_is_finished_by_the_same_command(env, monkeypatch, br
     assert not [p for top in (env.cfg.import_dir, env.md.parent, env.cfg.data_dir) for p in top.glob(".*tmp")]
 
 
-def test_a_worker_run_after_a_cut_short_apply_honours_the_record(env, monkeypatch):
+def test_a_worker_run_after_a_cut_short_apply_leaves_the_sound_to_the_command(env, monkeypatch):
     plan = redact.plan(env.cfg, env.store, env.memo, 30_000, 59_000)
     with monkeypatch.context() as m:
         m.setattr(redact, "_silence_in_place", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
         with pytest.raises(KeyboardInterrupt):
             apply(env, plan["start_ms"], plan["end_ms"])
-    Worker(env.cfg, transcriber=env.fake).run()  # the timed run comes first
-    assert opus.unsilent(env.audio, plan["start_ms"], plan["end_ms"]) == 0 and len(env.fake.calls) == 3
+    loud = opus.unsilent(env.audio, plan["start_ms"], plan["end_ms"])
+    Worker(env.cfg, transcriber=env.fake).run()  # a timed run comes first: it does not finish the job on its own
+    assert opus.unsilent(env.audio, plan["start_ms"], plan["end_ms"]) == loud > 1000 and len(env.fake.calls) == 3
+    again = redact.plan(env.cfg, env.store, env.memo, 30_000, 59_000)  # the bounds can be looked at once more
+    assert (again["start_ms"], again["end_ms"]) == (plan["start_ms"], plan["end_ms"]) and len(again["edge"]["before"]) == 12
     apply(env, plan["start_ms"], plan["end_ms"])
     assert files_with(env) == [] and redact.verify(env.cfg, env.store, env.memo)["ok"]
 

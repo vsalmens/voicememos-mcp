@@ -46,7 +46,7 @@ from . import notation, opus
 from .store import SCHEMA, Store, read_json, write_json_atomic, write_text_atomic
 
 log = logging.getLogger(__name__)
-EDGE_WORDS = 3
+EDGE_WORDS = 12  # enough to recognise the place; they are outside the range
 LOCK_WAIT_S = 600.0
 REPORT_PAD_MS = 30_000  # a report sample shows the words around a disagreement
 
@@ -112,7 +112,11 @@ class Recording:
         elif not opus.is_opus(candidate):
             self.audio_problem = f"the audio is not Ogg Opus ({candidate.suffix or 'no suffix'}): only that can be silenced in place"
         else:
-            self.audio = candidate
+            try:
+                opus.info(candidate)  # read whole: a file the editor refuses is known before anything is changed
+                self.audio = candidate
+            except opus.OpusError as e:
+                self.audio_problem = f"the audio cannot be edited: {e}"
 
     def render(self, data: dict) -> str:
         """The transcript as ``Store.rewrite_transcript`` would write it, without writing."""
@@ -320,7 +324,8 @@ def ensure_audio(store: Store, memo_id: str, path: Path) -> bool:
     """Before anything reads a recording's audio: every range on its record is silent in it. True when the
     file was changed (it had been fetched again, or an earlier run was cut short). Never raises."""
     try:
-        ranges = store.redactions_for(memo_id)
+        # Only ranges whose apply finished: sound is destroyed by the person's own command, never by a timed run.
+        ranges = [r for r in store.redactions_for(memo_id) if r.get("state") == "done"]
         if not ranges or not path.is_file():
             return False
         fp = _fingerprint(path)
@@ -389,6 +394,15 @@ def _lines(old: str, new: str) -> tuple[list[int], list[int]]:
     return sorted(set(removed) - set(cut)), sorted(set(cut))
 
 
+def _edge(words: list[dict], inside: list[int]) -> dict:
+    """The words just before and just after the range (outside it), for the person who checks the bounds."""
+    if not inside:
+        return {"before": [], "after": []}
+    first, last = inside[0], inside[-1]
+    return {"before": [w.get("text", "") for w in words[max(0, first - EDGE_WORDS):first]],
+            "after": [w.get("text", "") for w in words[last + 1:last + 1 + EDGE_WORDS]]}
+
+
 def plan(cfg, store: Store, memo_id: str, from_ms: int, to_ms: int) -> dict:
     """What taking the range out would do, in numbers. Changes nothing."""
     rec = Recording(cfg, store, memo_id)
@@ -404,7 +418,7 @@ def plan(cfg, store: Store, memo_id: str, from_ms: int, to_ms: int) -> dict:
         done = known.get("state") == "done" and not left and marker in rec.md.read_text(encoding="utf-8").split("\n")
         return {"memo_id": rec.memo_id, "start_ms": from_ms, "end_ms": to_ms, "duration_ms": duration_ms, "whole": False,
                 "already": done, "begun": True, "words": left, "words_total": len(words), "source_tokens": 0, "markers": 0,
-                "reader_parts": 0, "edge": {"before": [], "after": []},
+                "reader_parts": 0, "edge": _edge(words, _inside(words, from_ms, to_ms)),
                 "transcript": {"path": str(rec.md), "lines_removed": [], "lines_cut": []}, "audio": audio, "files": []}
     cut = snap(data, from_ms, to_ms)
     new, counts = without(cfg, data, cut["start_ms"], cut["end_ms"], dt.date.today().isoformat())
@@ -416,8 +430,7 @@ def plan(cfg, store: Store, memo_id: str, from_ms: int, to_ms: int) -> dict:
         "whole": cut["whole"], "already": False,
         "words": counts["words"], "words_total": len(words), "source_tokens": counts["source_tokens"],
         "markers": counts["markers"], "reader_parts": counts["reader_parts"],
-        "edge": {"before": [w.get("text", "") for w in words[max(0, cut["first"] - EDGE_WORDS):cut["first"]]],
-                 "after": [w.get("text", "") for w in words[cut["last"] + 1:cut["last"] + 1 + EDGE_WORDS]]},
+        "edge": _edge(words, [cut["first"], cut["last"]]),
         "transcript": {"path": str(rec.md), "lines_removed": removed, "lines_cut": shortened},
         "audio": audio, "files": files + ([str(rec.audio)] if rec.audio else []),
         **({"roam": "this memo was pushed to Roam: the block there is not touched"} if rec.entry.get("roam") else {}),
