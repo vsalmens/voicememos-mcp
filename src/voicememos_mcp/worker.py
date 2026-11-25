@@ -214,6 +214,7 @@ class Worker:
         self._cut_audio = audio_cutter
         self.roam_session = roam_session
         self.clock = clock
+        self.timer: Callable[[], float] = time.monotonic  # stage times (extras against the engine's own)
         self.state: dict = {}
         self._state_saved: str | None = None
         self._fp_cache: dict[str, str | None] = {}
@@ -817,14 +818,17 @@ class Worker:
                 return self._transcribe_segmented(memo, path, fingerprint, entry, item, force, push_roam)
             with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
                 audio = prepare_audio(path, Path(tmp))
+                began = self.timer()
                 tokens = self._primary_tokens(memo, fingerprint, audio, force, keep=not dry_run)
+                primary_s = self.timer() - began
                 words, had_confidence = notation.tokens_to_words(tokens)
                 if dry_run:
                     text = "\n\n".join(notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min,
                                                               self.cfg.pause_ms, notation.speaker_labels(words)))
                     return {**item, "status": "dry_run", "stats": notation.stats(words, self.cfg.threshold),
                             "text": text, "confidence_available": had_confidence}
-                item = self._finish(memo, item, entry, fingerprint, audio, words, had_confidence, tokens, push_roam)
+                item = self._finish(memo, item, entry, fingerprint, audio, words, had_confidence, tokens, push_roam,
+                                    primary_s=primary_s)
             shutil.rmtree(self.store.tmp_dir / memo.id, ignore_errors=True)  # the saved result is in the transcript now
             return item
         except Exception as exc:  # noqa: BLE001 - one failing memo must not stop the run
@@ -839,9 +843,15 @@ class Worker:
             return {**item, "status": "failed", "error": str(exc)[:300], **({"unavailable": True} if unavailable else {})}
 
     def _finish(self, memo: Memo, item: dict, entry: dict, fingerprint: str, audio: Path, words: list[dict],
-                had_confidence: bool, tokens: list[dict], push_roam: bool, segments: dict | None = None) -> dict:
-        """Second reader, voiceprint, transcript files and state for a fresh primary transcript."""
+                had_confidence: bool, tokens: list[dict], push_roam: bool, segments: dict | None = None,
+                primary_s: float | None = None) -> dict:
+        """Second reader, voiceprint, transcript files and state for a fresh primary transcript.
+
+        ``primary_s`` is how long the engine's own transcription took; what is done on top of it
+        (second reader, voiceprint) is timed here and held against it (``_timing``)."""
         second_record = None
+        extras_s: dict[str, float] = {}
+        began = self.timer()
         reader = self.second_reader()
         if reader is not None:
             total_min = float(self.cfg.get("VOICEMEMOS_SECOND_READER_MAX_TOTAL_MIN") or 0)
@@ -855,15 +865,22 @@ class Worker:
             elif self.is_long(memo, words) or self.wants_second_read(words):
                 only_uncertain = self.cfg.get("VOICEMEMOS_SECOND_READER") == "gemini-low"
                 words, second_record = self._apply_second_reader(reader, audio, memo, words, only_uncertain)
+                extras_s["second_reader"] = self.timer() - began
+        began = self.timer()
         if segments:
             speakers, voice = self._identify_parts(audio, words, segments["bounds_s"])
         else:
             speakers, voice = self._identify(audio, words, notation.speaker_labels(words))
+        if voice:
+            extras_s["voiceprint"] = self.timer() - began
+        timing = self._timing(primary_s, extras_s)
         engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
                   "language_hints": self.cfg.languages}
         extra = {"language": align.dominant_language(words), "speakers": speakers, "voiceprint": voice,
                  "readers": [{"role": "primary", **engine, "created": now_iso()}]
                  + ([second_record] if second_record else [])}
+        if timing:
+            extra["timing"] = timing
         if segments:
             extra["segments"] = segments
         result = self.store.write_transcript(
@@ -882,11 +899,33 @@ class Worker:
             new_entry["roam"] = entry["roam"]
         self.state[memo.id] = new_entry
         item.update(status="transcribed", markdown=result["markdown"], stats=result["stats"])
+        if timing:
+            item["timing"] = timing
+            self.store.add_usage(primary_s=timing.get("primary_s") or 0, extras_s=timing["extras_total_s"])
         if segments:
             item["segments"] = segments["count"]
         if push_roam and self.cfg.flag("VOICEMEMOS_ROAM_ENABLED") and not new_entry.get("roam"):
             self._push_roam(memo, words, result, new_entry, item)
         return item
+
+    def _timing(self, primary_s: float | None, extras_s: dict[str, float]) -> dict | None:
+        """The stage times of one transcription, for the sidecar: the engine's own time, each extra
+        stage, and the extras' share of the engine's time against VOICEMEMOS_EXTRAS_MAX_SHARE
+        (0.10: what is added on top may cost about a tenth of the processing). The share is absent,
+        never zero, when the engine's time is not known (a result saved by an interrupted run, a
+        memo in parts)."""
+        if not primary_s and not extras_s:
+            return None
+        total = round(sum(extras_s.values()), 2)
+        out: dict = {"extras_s": {k: round(v, 2) for k, v in extras_s.items()}, "extras_total_s": total}
+        limit = float(self.cfg.get("VOICEMEMOS_EXTRAS_MAX_SHARE") or 0)
+        if primary_s is not None and primary_s > 0:
+            out["primary_s"] = round(primary_s, 2)
+            out["extras_share"] = round(total / primary_s, 3)
+            if limit:
+                out["limit"] = limit
+                out["over"] = out["extras_share"] > limit
+        return out
 
     # ------------------------------------------------------------------ memos in parts
     def _plan(self, memo: Memo, audio: Path) -> list[float]:
@@ -1457,6 +1496,12 @@ class Worker:
         if not dry_run:
             snapshot = self._snapshot(memos)
             failed = [m["short_id"] for m in snapshot["memos"] if m.get("status") == "failed"]
+            slow = [i for i in summary["transcribed"] if isinstance(i, dict) and (i.get("timing") or {}).get("over")]
+            if slow:
+                worst = max(i["timing"]["extras_share"] for i in slow)
+                found["extras_slow"] = (f"{len(slow)} recording(s) spent more on the extra stages (second reader, "
+                                        f"voiceprint, tone) than {100 * slow[0]['timing']['limit']:.0f} % of the "
+                                        f"engine's own time (largest {100 * worst:.0f} %; VOICEMEMOS_EXTRAS_MAX_SHARE).")
             if failed:
                 found["memo_failed"] = (f"{len(failed)} memo(s) could not be transcribed after "
                                         f"{self.cfg.max_attempts} tries ({', '.join(failed[:5])}"

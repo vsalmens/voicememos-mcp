@@ -75,6 +75,17 @@ A run that finds nothing to do writes only `worker.json` and nothing to its log.
 files to Soniox, tokens and calls to Gemini (counted from version 0.8; not prices, which
 change). `voicememos_status` and `voicememos-mcp check` show the last months.
 
+### What the extra stages take
+
+What is done on top of the engine's own transcription (second reader, voiceprint) may take about a
+tenth of the time the transcription itself took. Each transcript's JSON holds `timing`: the
+engine's time (`primary_s`), each extra stage (`extras_s`), their share (`extras_share`) and
+whether it passed `VOICEMEMOS_EXTRAS_MAX_SHARE` (`over`). A run in which a recording passed the
+limit raises the alert `extras_slow` in `worker.json` (how many recordings, the largest share, no
+title), and `usage.json` sums `primary_s` and `extras_s` per month. The share is absent, never
+zero, when the engine's time is not known: a result saved by an interrupted run, or a memo
+transcribed in parts. It is a measurement and a warning; nothing is skipped because of it.
+
 ## Uncertainty notation
 
 | Markdown | Meaning |
@@ -420,6 +431,7 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_LOG_MAX_MB` | `5` | size at which a worker log is set aside as `*.1`; `0` = never |
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
+| `VOICEMEMOS_EXTRAS_MAX_SHARE` | `0.10` | the extra stages' time against the engine's own, above which `extras_slow` is raised; `0` = no limit |
 | `VOICEMEMOS_SKIP_TITLE_KEYWORD` | `notranscript` | memos with this word in the title are listed but never transcribed |
 | `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence; `*` accepts inflected forms (`question*=Question`) |
 | `VOICEMEMOS_MARKER_WAKE` | | wake word required before a marker word, e.g. `dictate*`; empty = marker word alone |
@@ -438,6 +450,13 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 
 Excluded memos are never transcribed, and the MCP tools cannot see them, not even their
 titles.
+
+Patient conversations are outside this package's scope, and the exclusion is how that is held:
+a recording in a folder named in `VOICEMEMOS_EXCLUDE_FOLDERS` (or with a title that matches
+`VOICEMEMOS_EXCLUDE_TITLE_REGEX`) is never sent to an engine, never written, never listed. The
+package has no notion of a patient of its own: it holds only for the folders the setting names.
+On the owner's Mac mini the setting was empty on 26.11.2026 (checked), so nothing is excluded
+there until a folder is named; that is the owner's setting to make.
 
 ## MCP tools
 
