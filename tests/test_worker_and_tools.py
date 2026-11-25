@@ -253,6 +253,58 @@ def test_status_reports_worker_problems(cfg, fake, tmp_path):
     assert "cannot read" in Tools(broken).status()["warnings"][0].lower()
 
 
+def test_health_says_when_each_origin_last_worked_and_a_failing_run_does_not_erase_it(cfg, fake, tmp_path):
+    """On 25.11.2026 Vipu showed voicememos silent for 20 days and nothing told a stalled iCloud sync from "no
+    recordings": the worker was fine, Plaud arrived daily, and Apple's folder had no file after 5.11."""
+    import os
+
+    from voicememos_mcp.worker import folder_times, origin_of
+
+    cfg.import_dir.mkdir(parents=True)
+    (cfg.import_dir / "plaud_abc.ogg").write_bytes(b"\0" * 64)
+    (cfg.import_dir / "plaud_abc.ogg.json").write_text(json.dumps(
+        {"title": "A meeting", "recorded": "2026-11-25T18:40:00+02:00", "duration_s": 9.0, "folder": "Plaud"}))
+    (cfg.import_dir / "zoom.m4a").write_bytes(b"\0" * 64)
+    old = time.time() - 3600
+    for f in cfg.import_dir.iterdir():
+        os.utime(f, (old, old))
+    summary = run(cfg, fake)
+    health = Tools(cfg).status()["health"]
+    assert health == summary["health"] and health["last_error"] is None
+    assert set(health["last_transcription"]) == {"voicememos", "plaud", "import"}
+    assert health["last_transcription"]["plaud"]["recorded"] == "2026-11-25T18:40:00+02:00"
+    assert health["newest_recording"]["plaud"] == "2026-11-25T18:40:00+02:00" and health["library_read_at"]
+    apple = health["apple_folder"]
+    assert apple["audio_files"] == 4 and apple["newest_file"] and apple["db_modified"]  # the files there are, not the memos listed
+    text = json.dumps(health)
+    assert "Morning walk" not in text and "A meeting" not in text  # times and counts, never a title
+    memos = {origin_of(m) for m in Worker(cfg, transcriber=fake)._memos()}
+    assert memos == {"voicememos", "plaud", "import"}
+
+    # an idle run keeps the times of the last transcription; only the read time moves
+    again = run(cfg, fake)["health"]
+    assert again["last_transcription"] == health["last_transcription"] and again["apple_folder"] == apple
+
+    # a run that cannot read the library names the error and keeps what the run before knew
+    hidden = cfg.recordings_dir.rename(tmp_path / "away")
+    failed = run(cfg, fake)
+    assert not failed["ok"] and failed["health"]["apple_folder"] == {"missing": True}
+    assert failed["health"]["library_read_at"] == again["library_read_at"]
+    assert failed["health"]["last_transcription"] == health["last_transcription"]
+    assert "not found" in failed["health"]["last_error"]["line"] and failed["health"]["last_error"]["at"]
+    hidden.rename(cfg.recordings_dir)
+    healed = run(cfg, fake)["health"]
+    assert healed["last_error"] == failed["health"]["last_error"]  # the last error stays, with its time
+    assert folder_times(tmp_path / "nowhere") == {"missing": True}
+
+
+def test_a_failed_memo_is_the_last_error_without_its_title(cfg):
+    summary = run(cfg, FakeTranscriber(fail_for=("BBBB2222",)))
+    line = summary["health"]["last_error"]["line"]
+    assert "simulated failure" in line and "bbbb2222" in line and "Car notes" not in line
+    assert "voicememos" in summary["health"]["last_transcription"]  # the other memo went through
+
+
 def test_transcript_path_traversal_is_rejected(cfg, fake):
     run(cfg, fake)
     assert Tools(cfg).store.load_transcript("../data/state.json") is None

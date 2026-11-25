@@ -76,6 +76,40 @@ def _epoch(iso: str | None) -> float | None:
         return None
 
 
+def origin_of(memo: Memo) -> str:
+    """Where a recording came from: voicememos (Apple's library), plaud (fetched from a Plaud
+    recorder) or import (any other file put into the import folder)."""
+    if not memo.imported:
+        return "voicememos"
+    return "plaud" if (memo.folder or "").casefold() == "plaud" else "import"
+
+
+def folder_times(recordings_dir: Path) -> dict:
+    """What Apple's Recordings folder looks like from outside: how many audio files, when the
+    newest of them was written, and when the library's database last changed (the -shm file is
+    left out: every reader touches it). A library that syncs moves these; one that has stopped
+    syncing does not, which a count of memos alone cannot tell from "nothing was recorded"."""
+    try:
+        if not recordings_dir.is_dir():
+            return {"missing": True}
+        newest, files, db = None, 0, None
+        for path in recordings_dir.iterdir():
+            name = path.name
+            if name.startswith("."):
+                continue
+            if name.startswith("CloudRecordings.db"):
+                if name in ("CloudRecordings.db", "CloudRecordings.db-wal"):
+                    db = max(db or 0, path.stat().st_mtime)
+                continue
+            if path.is_file():
+                files += 1
+                newest = max(newest or 0, path.stat().st_mtime)
+    except OSError as exc:
+        return {"unreadable": type(exc).__name__}
+    iso = lambda ts: dt.datetime.fromtimestamp(ts).astimezone().replace(microsecond=0).isoformat() if ts else None  # noqa: E731
+    return {"audio_files": files, "newest_file": iso(newest), "db_modified": iso(db)}
+
+
 def _size(fingerprint: str | None) -> str:
     return str(fingerprint or "").split(":")[0]
 
@@ -1245,7 +1279,7 @@ class Worker:
                     if str(exc) != self._previous.get("error"):  # in the log once, in worker.json while it lasts
                         log.error("%s", exc)
                     summary = {"ok": False, "started": started, "finished": now_iso(), "error": str(exc),
-                               "state_readable": False,
+                               "state_readable": False, "health": self._health(None, str(exc)),
                                "alerts": self._alerts({"state_unreadable": "The worker's state file cannot be read; "
                                                        "nothing is transcribed until it is repaired (see the README)."})}
                     if not dry_run:
@@ -1254,6 +1288,31 @@ class Worker:
                 return self._run(started, dry_run, limit, only, redo)
         except Busy as exc:
             return {"ok": True, "skipped": str(exc)}
+
+    def _health(self, memos: list[Memo] | None, error: str | None = None) -> dict:
+        """``worker.json["health"]``: when the library was last read, the newest recording and the
+        last finished transcription per origin (voicememos, plaud, import), Apple's folder as the
+        file system shows it, and the last error with its time. No title and no word of a memo.
+        What a run could not find out (the library was unreadable) is carried over from the run
+        before, so a failing run does not erase when things last worked."""
+        before = self._previous.get("health") if isinstance(self._previous.get("health"), dict) else {}
+        health = {"library_read_at": before.get("library_read_at"),
+                  "newest_recording": before.get("newest_recording") or {},
+                  "last_transcription": before.get("last_transcription") or {}}
+        if memos is not None:
+            newest: dict[str, str] = {}
+            last: dict[str, dict] = {}
+            for memo in memos:
+                origin = origin_of(memo)
+                if memo.recorded and (_epoch(memo.recorded) or 0) > (_epoch(newest.get(origin)) or 0):
+                    newest[origin] = memo.recorded
+                entry = self.state.get(memo.id, {})
+                if entry.get("ok") and (_epoch(entry.get("at")) or 0) > (_epoch(last.get(origin, {}).get("at")) or 0):
+                    last[origin] = {"at": entry["at"], "recorded": memo.recorded}
+            health.update(library_read_at=now_iso(), newest_recording=newest, last_transcription=last)
+        health["apple_folder"] = folder_times(self.cfg.recordings_dir)
+        health["last_error"] = {"at": now_iso(), "line": error[:300]} if error else before.get("last_error")
+        return health
 
     def _alerts(self, found: dict[str, str]) -> list[dict]:
         """``worker.json["alerts"]``: what needs a person, one entry per kind, no titles. Other
@@ -1313,7 +1372,8 @@ class Worker:
             memos = self._memos()
         except LibraryError as exc:
             summary = {"ok": False, "started": started, "finished": now_iso(), "error": str(exc),
-                       "library_readable": False, "alerts": self._alerts(found)}
+                       "library_readable": False, "alerts": self._alerts(found),
+                       "health": self._health(None, str(exc))}
             if plaud_summary is not None:
                 summary["plaud"] = plaud_summary
             if not dry_run:
@@ -1354,7 +1414,8 @@ class Worker:
         if work and not dry_run:
             self.store.write_library(self._snapshot(memos))
             self.store.write_worker({"ok": True, "running": True, "started": started, "library_readable": True,
-                                     "memos": len(memos), "alerts": self._previous.get("alerts") or []})
+                                     "memos": len(memos), "alerts": self._previous.get("alerts") or [],
+                                     "health": self._previous.get("health") or {}})
 
         if only:
             targets = self._resolve_request({"memos": only}, memos)
@@ -1404,6 +1465,10 @@ class Worker:
             self.store.write_library(snapshot)
             summary["finished"] = now_iso()
             summary["alerts"] = self._alerts(found)
+            errors = [f"{i.get('short_id')}: {i.get('error')}" for i in summary["failed"] if isinstance(i, dict)]
+            if plaud_summary is not None and not plaud_summary["ok"]:
+                errors.append(f"Plaud: {plaud_summary.get('error') or 'some recordings were not fetched'}")
+            summary["health"] = self._health(memos, "; ".join(errors) or None)
             self.store.write_worker({k: v for k, v in summary.items() if k not in ("transcribed", "failed")}
                                     | {"transcribed_count": len(summary["transcribed"]),
                                        "failed_count": len(summary["failed"])})

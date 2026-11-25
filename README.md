@@ -55,6 +55,17 @@ A run that finds nothing to do writes only `worker.json` and nothing to its log.
   per kind: `{"kind": "plaud_login" | "plaud_fetch" | "memo_failed" | "state_unreadable",
   "line": "<one sentence, no titles>", "since": "<when it first appeared>"}`. `voicememos_status`
   shows the same list. A Plaud fetch has to fail for ten minutes before it is an alert.
+* **Health.** `worker.json` has `health`, written by every run (the file stays a few hundred
+  bytes; an idle run still writes nothing else) and shown by `voicememos_status`:
+  `library_read_at` (the last run that could read Voice Memos), `newest_recording` and
+  `last_transcription` per origin (`voicememos` for Apple's library, `plaud`, `import` for other
+  imported files; the transcription's time and its recording's time), `apple_folder` (how many
+  audio files the Recordings folder holds, when the newest was written and when
+  `CloudRecordings.db` or its `-wal` last changed) and `last_error` (time and one line, a memo by
+  its short id, never a title). A run that cannot read the library keeps what the run before
+  knew. `apple_folder` is what tells a stalled iCloud sync from no recordings: when the phone
+  has newer memos than `newest_file` and `db_modified`, the Mac is not receiving them (open
+  Voice Memos on the Mac once, check iCloud), and when it has none, nothing is wrong.
 * **Logs.** `logs/worker.log` and `worker.err.log` are set aside as `*.1` when they pass
   `VOICEMEMOS_LOG_MAX_MB` (5), one generation each.
 

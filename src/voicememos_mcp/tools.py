@@ -169,6 +169,10 @@ class Tools:
             "roam_enabled": self.cfg.flag("VOICEMEMOS_ROAM_ENABLED"),
             # What needs a person: [{"kind", "line", "since"}], empty when all is well.
             "alerts": alerts,
+            # When things last worked (worker.json): the library read, the newest recording and the
+            # last transcription per origin (voicememos, plaud, import), Apple's folder by its
+            # files' times, the last error. None before a worker of this version has run.
+            "health": worker.get("health"),
             # Sent to the engines per calendar month (audio minutes, tokens), newest first.
             "usage": self.store.recent_usage(),
             "warnings": warnings,
