@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import align, notation, quarantine, roam, segment
+from . import align, notation, quarantine, roam, segment, tone
 from .audio import cut_audio, find_tool, prepare_audio
 from .config import Config
 from .library import LibraryError, Memo, is_excluded, probe_duration, read_imports, read_library, skips_transcription
@@ -215,6 +215,7 @@ class Worker:
         self.roam_session = roam_session
         self.clock = clock
         self.timer: Callable[[], float] = time.monotonic  # stage times (extras against the engine's own)
+        self.tone_measurer: Callable | None = None  # tests: the audio figures without Praat
         self.state: dict = {}
         self._state_saved: str | None = None
         self._fp_cache: dict[str, str | None] = {}
@@ -897,12 +898,18 @@ class Worker:
             speakers, voice = self._identify(audio, words, notation.speaker_labels(words))
         if voice:
             extras_s["voiceprint"] = self.timer() - began
-        timing = self._timing(primary_s, extras_s)
         set_aside = None
         if self.cfg.flag("VOICEMEMOS_QUARANTINE_SHORT") and not segments:
             # A memo in parts is left as it is: its speaker labels hold within one part only.
             words, speakers, set_aside = quarantine.split(
                 words, speakers, float(self.cfg.get("VOICEMEMOS_QUARANTINE_MAX_S") or 0))
+        with_tone = self.cfg.flag("VOICEMEMOS_TONE") and not segments  # a memo in parts: no one speaker table
+        tone_side = None
+        if with_tone:
+            began = self.timer()
+            tone_side = self._tone(memo, audio, words, speakers, voice)
+            extras_s["tone"] = self.timer() - began
+        timing = self._timing(primary_s, extras_s)
         engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
                   "language_hints": self.cfg.languages}
         extra = {"language": align.dominant_language(words), "speakers": speakers, "voiceprint": voice,
@@ -912,12 +919,20 @@ class Worker:
             extra["timing"] = timing
         if set_aside:
             extra["quarantine"] = set_aside
+        if tone_side:
+            extra["tone"] = {k: tone_side[k] for k in ("line", "labels", "baseline")}
         if segments:
             extra["segments"] = segments
         result = self.store.write_transcript(
             memo.to_dict(), words, engine, had_confidence, self.cfg.threshold,
             self.cfg.run_min, self.cfg.pause_ms, self.cfg.marker_spec, source_tokens=tokens, extra=extra,
         )
+        if with_tone:
+            side = self.store._resolve(result["json"])
+            if side is not None and tone_side:
+                tone.write_side(side, tone_side)
+            elif side is not None:  # the owner is not in it (any more): no file says otherwise
+                tone.side_path(side).unlink(missing_ok=True)
         result["language"] = extra["language"]
         result["speakers"] = len(speakers)
         if voice:
@@ -938,6 +953,20 @@ class Worker:
         if push_roam and self.cfg.flag("VOICEMEMOS_ROAM_ENABLED") and not new_entry.get("roam"):
             self._push_roam(memo, words, result, new_entry, item)
         return item
+
+    def _tone(self, memo: Memo, audio: Path, words: list[dict], speakers: dict, voice: dict | None) -> dict | None:
+        """The side file's content for the owner's tone in this recording, or None when the owner is
+        not firmly in it or says too little (then the recording also leaves the baseline). Never raises."""
+        history = tone.History(self.store.data_dir / "tone.json")
+        try:
+            raw, missing = tone.measure(words, speakers, voice, lambda: self.load_audio(audio), self.tone_measurer)
+            if not raw:
+                history.drop(memo.id)
+                return None
+            return tone.record({"id": memo.id, "recorded": memo.recorded}, raw, missing, history)
+        except Exception:  # noqa: BLE001 - the transcript does not depend on this
+            log.exception("Tone failed for %s", memo.id)
+            return None
 
     def _timing(self, primary_s: float | None, extras_s: dict[str, float]) -> dict | None:
         """The stage times of one transcription, for the sidecar: the engine's own time, each extra

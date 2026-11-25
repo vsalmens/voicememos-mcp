@@ -83,6 +83,7 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_DIARIZATION": "1",
     "VOICEMEMOS_QUARANTINE_SHORT": "0",   # set aside a foreign voice with under QUARANTINE_MAX_S of speech (quarantine.py)
     "VOICEMEMOS_QUARANTINE_MAX_S": "5",
+    "VOICEMEMOS_TONE": "0",               # the owner's own voice against their own baseline (tone.py); measured, local
     "VOICEMEMOS_VOICEPRINT_NAME": "",
     "VOICEMEMOS_VOICEPRINT_MODEL": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced",
     "VOICEMEMOS_SECOND_READER": "",

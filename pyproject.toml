@@ -21,7 +21,8 @@ classifiers = [
 
 [project.optional-dependencies]
 voiceprint = ["sherpa-onnx>=1.10", "numpy>=1.24"]
-test = ["pytest>=8", "numpy>=1.24"]
+tone = ["praat-parselmouth>=0.4.5", "numpy>=1.24"]
+test = ["pytest>=8", "numpy>=1.24", "praat-parselmouth>=0.4.5"]
 
 [project.scripts]
 voicememos-mcp = "voicememos_mcp.cli:main"

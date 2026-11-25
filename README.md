@@ -199,6 +199,47 @@ The voiceprint is biometric data. It is stored only in `DATA_DIR/voiceprint.json
 600), never in transcripts, and the MCP tools report only a summary. Delete that file to
 remove it.
 
+## Tone of voice (optional)
+
+`VOICEMEMOS_TONE=1` (off by default) measures how you sounded in a recording against how you
+usually sound. It is measured, not guessed, and nothing in it names a feeling.
+
+- From the engine's word times: speech rate (syllables per second of speaking) and the share of
+  pauses inside your own turns.
+- From the audio, with Praat (`pip install voicememos-mcp[tone]`, the `praat-parselmouth` package,
+  0.4.7 with wheels for Apple silicon and Python 3.13 checked on 26.11.2026): median pitch and how
+  much it moves, level, jitter and shimmer. Without the package the two figures from the word
+  times are still made and the side file says the rest is missing.
+
+Only your own voice is measured, and only when the voiceprint recognised it firmly: a possible
+match, no voiceprint, or a recording without you yields nothing. Other speakers are never
+measured. A recording that is excluded is never measured, like everything else about it.
+
+Each figure is held against your own baseline: the median of the 30 recordings before this one
+that have it. What is written is the deviation in robust units, not the raw figure, since a
+microphone or a car moves the raw figures more than a mood does. Until five earlier recordings
+exist there is no deviation and no line.
+
+- `<transcript>.tone.json` beside the transcript's JSON: recording id and time, how many
+  recordings the baseline had, the deviations, and the words chosen. No raw figure, no word.
+- One line in the transcript's header: `[sävy: nopea, korkea, vähän taukoja]`, or
+  `[sävy: tavallinen]` when nothing stands out by a robust unit or more. The transcript's own text
+  is byte for byte what it is without the setting.
+- `DATA_DIR/tone.json` (mode 600) keeps the raw figures the baseline is made of.
+
+At most two minutes of your speech are analysed per recording, and the time is counted among the
+extra stages (see [What the extra stages take](#what-the-extra-stages-take)). It applies to
+recordings transcribed after it is turned on; a memo transcribed in parts gets none. Programs
+that read the transcripts (Vipu) can read the side files as a series.
+
+**Not built: a model's guess of the feeling.** A second layer, emotion2vec+ large (an MLX
+conversion for Apple silicon) writing `[tunne?: …]`, always with a question mark, is left
+unbuilt on purpose. It would need the model on disk (about 1.2 GB for the large model with its
+runtime, to be measured before the choice; the owner's Mac mini had 11 GB free on 26.11.2026), a
+setting of its own that is off by default, the same owner-only rule and time limit as above, and
+first of all a check by the owner on their own Finnish recordings: no measurement of that model on
+Finnish speech was found, so its guesses would be of unknown worth until the owner has looked.
+
 ## Recordings from elsewhere
 
 A Zoom recording, a phone call or a file from a dictaphone is not a Voice Memo, but it can go
@@ -466,6 +507,7 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_VOICEPRINT_NAME` | | your name, shown when the voiceprint recognises you |
 | `VOICEMEMOS_QUARANTINE_SHORT` | `0` | set aside a foreign voice with only a few seconds of speech in the recording (see [Voiceprint](#voiceprint-optional)) |
 | `VOICEMEMOS_QUARANTINE_MAX_S` | `5` | that many seconds of speech in all |
+| `VOICEMEMOS_TONE` | `0` | measure your own voice against your own baseline (see [Tone of voice](#tone-of-voice-optional)) |
 | `VOICEMEMOS_SECOND_READER` | | `gemini` = second reading for every new memo, `gemini-low` = only for memos with low certainty |
 | `VOICEMEMOS_SECOND_READER_MODEL` | `gemini-4-argon` | |
 | `VOICEMEMOS_SECOND_READER_MAX_MIN` | `60` | longer recordings are read in parts |

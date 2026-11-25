@@ -502,6 +502,8 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
     aside = quarantine.line(data.get("quarantine"))
     if aside:
         front += [f"> {aside}", ""]
+    if (data.get("tone") or {}).get("line"):  # the owner's voice against their own baseline (tone.py)
+        front += [f"> {data['tone']['line']}", ""]
     if not data.get("confidence_available"):
         front += ["> Warning: the engine returned no confidence values, so nothing is marked as uncertain.", ""]
     if markers:
