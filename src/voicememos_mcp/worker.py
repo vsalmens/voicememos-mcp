@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import align, notation, roam, segment
+from . import align, notation, quarantine, roam, segment
 from .audio import cut_audio, find_tool, prepare_audio
 from .config import Config
 from .library import LibraryError, Memo, is_excluded, probe_duration, read_imports, read_library, skips_transcription
@@ -593,6 +593,30 @@ class Worker:
         store.save(data)
         return store.summary()
 
+    def add_other_voice_file(self, path: Path, name: str) -> dict:
+        """Store a known other voice ("not me") from an audio file that holds only that voice: a
+        sample of a speech synthesiser, say, which no memo holds alone. Nothing is transcribed and
+        nothing is sent anywhere; the file is read where it is and not copied."""
+        from .voiceprint import Voiceprint, other_voice
+
+        store = Voiceprint(self.store.voiceprint_path)
+        data = store.load()
+        if not data:
+            raise RuntimeError("enroll your own voiceprint first")
+        if data.get("model") != self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL"):
+            raise RuntimeError("the voiceprint was made with another model; enroll again first")
+        path = Path(path).expanduser()
+        if not path.is_file():
+            raise RuntimeError(f"no such file: {path.name}")
+        with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+            samples = self.load_audio(prepare_audio(path, Path(tmp)))
+            voice = other_voice(name, samples, None, None, self.embedder())
+        voice.update(memo_id=None, speaker=None, file=path.name)
+        others = [o for o in data.get("others", []) if (o.get("name"), o.get("file")) != (name, path.name)]
+        data["others"] = others + [voice]
+        store.save(data)
+        return store.summary()
+
     def remove_other_voice(self, name: str) -> dict:
         from .voiceprint import Voiceprint
 
@@ -874,6 +898,11 @@ class Worker:
         if voice:
             extras_s["voiceprint"] = self.timer() - began
         timing = self._timing(primary_s, extras_s)
+        set_aside = None
+        if self.cfg.flag("VOICEMEMOS_QUARANTINE_SHORT") and not segments:
+            # A memo in parts is left as it is: its speaker labels hold within one part only.
+            words, speakers, set_aside = quarantine.split(
+                words, speakers, float(self.cfg.get("VOICEMEMOS_QUARANTINE_MAX_S") or 0))
         engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
                   "language_hints": self.cfg.languages}
         extra = {"language": align.dominant_language(words), "speakers": speakers, "voiceprint": voice,
@@ -881,6 +910,8 @@ class Worker:
                  + ([second_record] if second_record else [])}
         if timing:
             extra["timing"] = timing
+        if set_aside:
+            extra["quarantine"] = set_aside
         if segments:
             extra["segments"] = segments
         result = self.store.write_transcript(

@@ -35,7 +35,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-from . import notation
+from . import notation, quarantine
 from .segment import clock
 
 SCHEMA = "voicememos-mcp/transcript@1"
@@ -499,6 +499,9 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
         verdict = {"match": f"matches {voice['name']}", "possible": f"possibly {voice['name']} (?)",
                    "no match": f"does not match {voice['name']}"}.get(voice.get("result"), voice.get("result"))
         front += [f"> Voiceprint: {verdict} (similarity {voice['score']:.2f}).", ""]
+    aside = quarantine.line(data.get("quarantine"))
+    if aside:
+        front += [f"> {aside}", ""]
     if not data.get("confidence_available"):
         front += ["> Warning: the engine returned no confidence values, so nothing is marked as uncertain.", ""]
     if markers:

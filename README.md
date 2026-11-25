@@ -168,6 +168,32 @@ Add such a voice from one speaker of a memo, e.g.
 Known other voices are never shown as labels; they only stop a speaker from being labelled as
 you when that speaker is as close, or nearly as close, to a known other voice. Run
 `action="identify"` again afterwards; `action="remove_other", name="<name>"` removes one.
+The same from the command line: `voicememos-mcp voiceprint add-other --memo <id> --speaker S1
+--name "<name>"` and `voiceprint remove-other --name "<name>"`.
+
+**A speech synthesiser's voice.** An assistant that answers aloud while you dictate is a voice
+no memo holds alone, so it is registered from a file: save a sample of that voice speaking for
+half a minute or more (at least some six seconds are needed), and run
+
+```bash
+voicememos-mcp voiceprint add-other-file --file ~/Desktop/claude-tts.m4a --name "Claude TTS"
+```
+
+The file is read where it is, nothing is transcribed or sent, and only the voice's vector is
+kept in `voiceprint.json` beside your own. Running it again with the same file and name replaces
+the earlier vector. Like every known other voice it only stops that voice from being labelled
+as you; it is never shown by name. Use one sample per synthetic voice you listen to.
+
+**Short snippets of other voices** (`VOICEMEMOS_QUARANTINE_SHORT=1`, off by default). In a
+recording where the voiceprint has found you, a speaker whose speech adds up to less than
+`VOICEMEMOS_QUARANTINE_MAX_S` (5 s) in the whole recording is set aside: an assistant's few
+words, a radio, someone passing. The rule is about the voice, not the turn, so a person you
+talk with, who says many short things, stays. The transcript says in one line how many snippets
+were set aside; the JSON lists each under `quarantine` (speaker label, start, end, number of
+words), and the engine's raw tokens still hold the words. Your own speaker is never set aside,
+and when nobody is recognised nothing is. A memo transcribed in parts is left as it is. It is
+off by default because it changes what a transcript shows; it applies to recordings transcribed
+after it is turned on (`sync --memo ID --redo` for an older one).
 
 The voiceprint is biometric data. It is stored only in `DATA_DIR/voiceprint.json` (file mode
 600), never in transcripts, and the MCP tools report only a summary. Delete that file to
@@ -438,6 +464,8 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_MARKER_END` | | end word after the wake word that closes a longer marker, e.g. `end` |
 | `VOICEMEMOS_DIARIZATION` | `1` | separate speakers in conversations |
 | `VOICEMEMOS_VOICEPRINT_NAME` | | your name, shown when the voiceprint recognises you |
+| `VOICEMEMOS_QUARANTINE_SHORT` | `0` | set aside a foreign voice with only a few seconds of speech in the recording (see [Voiceprint](#voiceprint-optional)) |
+| `VOICEMEMOS_QUARANTINE_MAX_S` | `5` | that many seconds of speech in all |
 | `VOICEMEMOS_SECOND_READER` | | `gemini` = second reading for every new memo, `gemini-low` = only for memos with low certainty |
 | `VOICEMEMOS_SECOND_READER_MODEL` | `gemini-4-argon` | |
 | `VOICEMEMOS_SECOND_READER_MAX_MIN` | `60` | longer recordings are read in parts |
@@ -495,6 +523,7 @@ voicememos-mcp transcribe-file memo.m4a --threshold 0.6 --threshold 0.8   # cali
 voicememos-mcp second-read --since 2026-01-01 --limit 20   # add the second reader
 voicememos-mcp report                        # compare readers per language
 voicememos-mcp voiceprint status             # enrollment state and suggestions
+voicememos-mcp voiceprint add-other-file --file tts.m4a --name "Claude TTS"   # a synthesiser's voice as "not me"
 voicememos-mcp launchd-plist                 # print the launchd job definition
 voicememos-mcp redact plan --memo ID --from-ms 6795000 --to-ms 7137000   # see below
 ```
