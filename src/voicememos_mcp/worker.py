@@ -511,7 +511,7 @@ class Worker:
         return words, record
 
     # ------------------------------------------------------------------ speakers and measurements
-    def _split_speakers(self, audio: Path, words: list[dict]) -> tuple[list[dict], dict | None]:
+    def _split_speakers(self, audio: Path, words: list[dict], fetch: bool = False) -> tuple[list[dict], dict | None]:
         """Divide and join the engine's speakers by voice (``diarize.py``). Returns (words,
         summary); the summary is None when the engine found one speaker, which is left alone: a
         dictation must not become two people because the room changed. Never raises."""
@@ -520,8 +520,19 @@ class Worker:
         words = diarize.restore(words)
         if len({str(w.get("speaker")) for w in words if w.get("speaker") not in (None, "")}) < 2:
             return words, None
+        if not fetch and self._embedder is None:
+            # On by default, so it must not be what downloads the voice model: it runs where the
+            # model already is (a voiceprint has been set up, or a pass was asked for by name).
+            model = self.store.models_dir / f"{self.cfg.get('VOICEMEMOS_VOICEPRINT_MODEL')}.onnx"
+            if not model.exists():
+                return words, None
         try:
-            words, summary = diarize.split(self.load_audio(audio), words, self.embedder())
+            embed = self.embedder()
+        except Exception as exc:  # noqa: BLE001 - no voice model on this machine: the engine's speakers stay
+            log.info("Speaker split skipped: %s", str(exc)[:200])
+            return words, None
+        try:
+            words, summary = diarize.split(self.load_audio(audio), words, embed)
             return words, {**summary, "model": self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL"), "created": now_iso()}
         except Exception as exc:  # noqa: BLE001 - the transcript must survive
             log.exception("Speaker split failed")
@@ -548,13 +559,13 @@ class Worker:
         return quarantine(words, speakers, max_s)
 
     def _speakers(self, audio: Path, words: list[dict], segments: dict | None,
-                  split: bool) -> tuple[list[dict], dict]:
+                  split: bool, fetch: bool = False) -> tuple[list[dict], dict]:
         """Who speaks: the optional own split, the voiceprint and names, and what is set aside.
         Returns (words, the transcript's keys ``speakers``, ``voiceprint``, ``speaker_split``,
         ``quarantine``; the last two only when there is something to say)."""
         out: dict = {}
         if split:
-            words, summary = self._split_speakers(audio, words)
+            words, summary = self._split_speakers(audio, words, fetch=fetch)
             if summary is not None:
                 out["speaker_split"] = summary
         if segments:
@@ -1041,7 +1052,7 @@ class Worker:
         split = self.cfg.flag("VOICEMEMOS_SPEAKER_SPLIT")
         words, who = self._speakers(audio, words, segments, split)
         speakers, voice = who["speakers"], who["voiceprint"]
-        if voice or split:
+        if voice or who.get("speaker_split"):
             extras_s["voiceprint"] = self.timer() - began
         prosody_summary = None
         if self.cfg.flag("VOICEMEMOS_PROSODY"):  # after the speakers: the levels are each speaker's own
@@ -1335,7 +1346,7 @@ class Worker:
                         done["adjudicate"] = record.get("error") or {
                             k: record.get(k) for k in ("spots", "asked", "judged", "primary", "second", "other", "unclear")}
                 if "speakers" in what:
-                    words, who = self._speakers(audio, words, data.get("segments"), split=True)
+                    words, who = self._speakers(audio, words, data.get("segments"), split=True, fetch=True)
                     for key in ("speaker_split", "quarantine"):
                         data.pop(key, None)
                     data.update(who)

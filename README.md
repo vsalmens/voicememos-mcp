@@ -214,7 +214,7 @@ remove it.
 
 The speech engine's speakers are often not people. Seen with Soniox v5 and v6 on meetings and
 on a recorder's ambient recordings: two people under one number, one person under two numbers,
-a minute of one person's talk under another's number. `VOICEMEMOS_SPEAKER_SPLIT="1"` (new
+a minute of one person's talk under another's number. `VOICEMEMOS_SPEAKER_SPLIT` (on by default, new
 memos) or `voicememos-mcp annotate speakers --memo <id>` (an existing transcript) looks at the
 engine's speakers again with the voiceprint's model, on this machine:
 
@@ -230,10 +230,24 @@ off only below 0.55 and joined only from 0.80 on; what falls between stays where
 put it. In those ten recordings the split moved between 0 % and 57 % of the words to another
 speaker. One check that did not depend on the split's own model output: where the owner's
 voiceprint matched, the other speakers scored lower against it after the split than before.
-**It has not been checked against a recording labelled by ear**, which is why it is off by
-default.
+Checked by ear on 26.11.2026: the owner named the speaker in sampled clips of a few seconds from two
+recordings, without seeing where either split had put them.
 
-What it does not do: a recording in which the engine found one speaker is never divided (a
+| Recording | Clips | People by ear | Purity: engine, split | Completeness: engine, split |
+|---|---|---|---|---|
+| Zoom meeting, 18 min | 40 | 9 | 68 %, 82 % | 77 %, 94 % |
+| Ambient (Plaud), 137 min | 18 | 6 | 46 %, 90 % | 58 %, 91 % |
+
+Purity is the share of a speaker's seconds that belong to its main person, completeness the
+share of a person's seconds under one speaker. Of the 28 clips the split had moved, 13 went to
+the right person's speaker, 15 were the same either way and none went from right to wrong. The
+samples are small, and half of them were drawn from the moved talk on purpose. Since then it is
+on by default (`VOICEMEMOS_SPEAKER_SPLIT="0"` turns it off) wherever the voice model is already on
+disk, that is, once a voiceprint has been set up. It never downloads the model by itself; without
+it the engine's speakers stay.
+
+What it does not do: in the meeting above the owner heard nine people and the split, like the
+engine, gave four speakers, so people with one or two short turns stay among the others. Also: a recording in which the engine found one speaker is never divided (a
 dictation must not become two people because the room changed); a person with a few seconds of
 talk is not found; one person recorded in two very different conditions can come out as two.
 The engine's own number stays in the data (`speaker_engine` on every word that moved), and
@@ -618,7 +632,7 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_SECOND_READER_CHUNK_MIN` | `30` | approximate length of a part |
 | `VOICEMEMOS_SECOND_READER_MAX_TOTAL_MIN` | `600` | longer memos get no automatic second reading |
 | `VOICEMEMOS_SEGMENT_LONG` | `1` | split memos longer than the engine accepts (see [Limitations](#limitations)) |
-| `VOICEMEMOS_SPEAKER_SPLIT` | `0` | divide and join the engine's speakers by voice ([Own speaker split](#own-speaker-split-optional)) |
+| `VOICEMEMOS_SPEAKER_SPLIT` | `1` | divide and join the engine's speakers by voice ([Own speaker split](#own-speaker-split-optional)) |
 | `VOICEMEMOS_PROSODY` | `0` | measure loudness, pitch and tempo per word ([How it was said](#how-it-was-said-optional)) |
 | `VOICEMEMOS_QUARANTINE_S` | `0` | leave an unknown voice with less talk than this out of the text; 0 = off |
 | `VOICEMEMOS_ADJUDICATE` | `0` | a third listening after every second reading ([Third listening](#third-listening)) |

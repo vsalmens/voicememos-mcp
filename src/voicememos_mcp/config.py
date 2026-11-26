@@ -96,7 +96,7 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_ADJUDICATOR_MODEL": "gemini-4-argon",
     "VOICEMEMOS_ADJUDICATE_MAX": "60",  # spots per recording, the most doubtful first
     # Local, with the voiceprint's model and numpy (pip install 'voicememos-mcp[voiceprint]'):
-    "VOICEMEMOS_SPEAKER_SPLIT": "0",  # divide and join the engine's speakers by voice (diarize.py)
+    "VOICEMEMOS_SPEAKER_SPLIT": "1",  # divide and join the engine's speakers by voice (diarize.py)
     "VOICEMEMOS_PROSODY": "0",  # measure loudness, pitch and tempo per word (prosody.py)
     # With a voiceprint: an unknown voice that says less than this many seconds in a recording
     # where the owner was recognised is left out of the rendered text (kept in the JSON). 0 = off.
