@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import align, notation, roam, segment
+from . import align, notation, roam, segment, tone
 from .audio import cut_audio, find_tool, prepare_audio, sound_only
 from .config import Config
 from .library import LibraryError, Memo, is_excluded, probe_duration, read_imports, read_library, skips_transcription
@@ -215,6 +215,8 @@ class Worker:
         self._cut_audio = audio_cutter
         self.roam_session = roam_session
         self.clock = clock
+        self.timer: Callable[[], float] = time.monotonic  # stage times (extras against the engine's own)
+        self.tone_measurer: Callable | None = None  # tests: the audio figures without Praat
         self.state: dict = {}
         self._state_saved: str | None = None
         self._fp_cache: dict[str, str | None] = {}
@@ -982,14 +984,17 @@ class Worker:
                 return self._transcribe_segmented(memo, path, fingerprint, entry, item, force, push_roam)
             with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
                 audio = prepare_audio(path, Path(tmp))
+                began = self.timer()
                 tokens = self._primary_tokens(memo, fingerprint, audio, force, keep=not dry_run)
+                primary_s = self.timer() - began
                 words, had_confidence = notation.tokens_to_words(tokens)
                 if dry_run:
                     text = "\n\n".join(notation.render_blocks(words, self.cfg.threshold, self.cfg.run_min,
                                                               self.cfg.pause_ms, notation.speaker_labels(words)))
                     return {**item, "status": "dry_run", "stats": notation.stats(words, self.cfg.threshold),
                             "text": text, "confidence_available": had_confidence}
-                item = self._finish(memo, item, entry, fingerprint, audio, words, had_confidence, tokens, push_roam)
+                item = self._finish(memo, item, entry, fingerprint, audio, words, had_confidence, tokens, push_roam,
+                                    primary_s=primary_s)
             shutil.rmtree(self.store.tmp_dir / memo.id, ignore_errors=True)  # the saved result is in the transcript now
             return item
         except Exception as exc:  # noqa: BLE001 - one failing memo must not stop the run
@@ -1004,9 +1009,15 @@ class Worker:
             return {**item, "status": "failed", "error": str(exc)[:300], **({"unavailable": True} if unavailable else {})}
 
     def _finish(self, memo: Memo, item: dict, entry: dict, fingerprint: str, audio: Path, words: list[dict],
-                had_confidence: bool, tokens: list[dict], push_roam: bool, segments: dict | None = None) -> dict:
-        """Second reader, voiceprint, transcript files and state for a fresh primary transcript."""
+                had_confidence: bool, tokens: list[dict], push_roam: bool, segments: dict | None = None,
+                primary_s: float | None = None) -> dict:
+        """Second reader, voiceprint, transcript files and state for a fresh primary transcript.
+
+        ``primary_s`` is how long the engine's own transcription took; what is done on top of it
+        (second reader, voiceprint) is timed here and held against it (``_timing``)."""
         second_record = None
+        extras_s: dict[str, float] = {}
+        began = self.timer()
         reader = self.second_reader()
         if reader is not None:
             total_min = float(self.cfg.get("VOICEMEMOS_SECOND_READER_MAX_TOTAL_MIN") or 0)
@@ -1020,24 +1031,53 @@ class Worker:
             elif self.is_long(memo, words) or self.wants_second_read(words):
                 only_uncertain = self.cfg.get("VOICEMEMOS_SECOND_READER") == "gemini-low"
                 words, second_record = self._apply_second_reader(reader, audio, memo, words, only_uncertain)
+                extras_s["second_reader"] = self.timer() - began
         third_record = None
         if second_record and not second_record.get("error") and self.cfg.flag("VOICEMEMOS_ADJUDICATE"):
+            began = self.timer()
             words, third_record = self._adjudicate(audio, memo, words)
-        words, who = self._speakers(audio, words, segments, self.cfg.flag("VOICEMEMOS_SPEAKER_SPLIT"))
+            extras_s["adjudicate"] = self.timer() - began
+        began = self.timer()
+        split = self.cfg.flag("VOICEMEMOS_SPEAKER_SPLIT")
+        words, who = self._speakers(audio, words, segments, split)
         speakers, voice = who["speakers"], who["voiceprint"]
+        if voice or split:
+            extras_s["voiceprint"] = self.timer() - began
+        prosody_summary = None
+        if self.cfg.flag("VOICEMEMOS_PROSODY"):  # after the speakers: the levels are each speaker's own
+            began = self.timer()
+            words, prosody_summary = self._measure(audio, words)
+            extras_s["prosody"] = self.timer() - began
+        with_tone = self.cfg.flag("VOICEMEMOS_TONE") and not segments  # a memo in parts: no one speaker table
+        tone_side = None
+        if with_tone:
+            began = self.timer()
+            tone_side = self._tone(memo, audio, words, speakers, voice)
+            extras_s["tone"] = self.timer() - began
+        timing = self._timing(primary_s, extras_s)
         engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
                   "language_hints": self.cfg.languages}
         extra = {"language": align.dominant_language(words), **who,
                  "readers": [{"role": "primary", **engine, "created": now_iso()}]
                  + ([second_record] if second_record else []) + ([third_record] if third_record else [])}
-        if self.cfg.flag("VOICEMEMOS_PROSODY"):  # after the speakers: the levels are each speaker's own
-            words, extra["prosody"] = self._measure(audio, words)
+        if prosody_summary:
+            extra["prosody"] = prosody_summary
+        if timing:
+            extra["timing"] = timing
+        if tone_side:
+            extra["tone"] = {k: tone_side[k] for k in ("line", "labels", "baseline")}
         if segments:
             extra["segments"] = segments
         result = self.store.write_transcript(
             memo.to_dict(), words, engine, had_confidence, self.cfg.threshold,
             self.cfg.run_min, self.cfg.pause_ms, self.cfg.marker_spec, source_tokens=tokens, extra=extra,
         )
+        if with_tone:
+            side = self.store._resolve(result["json"])
+            if side is not None and tone_side:
+                tone.write_side(side, tone_side)
+            elif side is not None:  # the owner is not in it (any more): no file says otherwise
+                tone.side_path(side).unlink(missing_ok=True)
         result["language"] = extra["language"]
         result["speakers"] = len(speakers)
         if voice:
@@ -1051,11 +1091,47 @@ class Worker:
             new_entry["roam"] = entry["roam"]
         self.state[memo.id] = new_entry
         item.update(status="transcribed", markdown=result["markdown"], stats=result["stats"])
+        if timing:
+            item["timing"] = timing
+            self.store.add_usage(primary_s=timing.get("primary_s") or 0, extras_s=timing["extras_total_s"])
         if segments:
             item["segments"] = segments["count"]
         if push_roam and self.cfg.flag("VOICEMEMOS_ROAM_ENABLED") and not new_entry.get("roam"):
             self._push_roam(memo, words, result, new_entry, item)
         return item
+
+    def _tone(self, memo: Memo, audio: Path, words: list[dict], speakers: dict, voice: dict | None) -> dict | None:
+        """The side file's content for the owner's tone in this recording, or None when the owner is
+        not firmly in it or says too little (then the recording also leaves the baseline). Never raises."""
+        history = tone.History(self.store.data_dir / "tone.json")
+        try:
+            raw, missing = tone.measure(words, speakers, voice, lambda: self.load_audio(audio), self.tone_measurer)
+            if not raw:
+                history.drop(memo.id)
+                return None
+            return tone.record({"id": memo.id, "recorded": memo.recorded}, raw, missing, history)
+        except Exception:  # noqa: BLE001 - the transcript does not depend on this
+            log.exception("Tone failed for %s", memo.id)
+            return None
+
+    def _timing(self, primary_s: float | None, extras_s: dict[str, float]) -> dict | None:
+        """The stage times of one transcription, for the sidecar: the engine's own time, each extra
+        stage, and the extras' share of the engine's time against VOICEMEMOS_EXTRAS_MAX_SHARE
+        (0.10: what is added on top may cost about a tenth of the processing). The share is absent,
+        never zero, when the engine's time is not known (a result saved by an interrupted run, a
+        memo in parts)."""
+        if not primary_s and not extras_s:
+            return None
+        total = round(sum(extras_s.values()), 2)
+        out: dict = {"extras_s": {k: round(v, 2) for k, v in extras_s.items()}, "extras_total_s": total}
+        limit = float(self.cfg.get("VOICEMEMOS_EXTRAS_MAX_SHARE") or 0)
+        if primary_s is not None and primary_s > 0:
+            out["primary_s"] = round(primary_s, 2)
+            out["extras_share"] = round(total / primary_s, 3)
+            if limit:
+                out["limit"] = limit
+                out["over"] = out["extras_share"] > limit
+        return out
 
     # ------------------------------------------------------------------ memos in parts
     def _plan(self, memo: Memo, audio: Path) -> list[float]:
@@ -1741,6 +1817,12 @@ class Worker:
         if not dry_run:
             snapshot = self._snapshot(memos)
             failed = [m["short_id"] for m in snapshot["memos"] if m.get("status") == "failed"]
+            slow = [i for i in summary["transcribed"] if isinstance(i, dict) and (i.get("timing") or {}).get("over")]
+            if slow:
+                worst = max(i["timing"]["extras_share"] for i in slow)
+                found["extras_slow"] = (f"{len(slow)} recording(s) spent more on the extra stages (second reader, "
+                                        f"voiceprint, tone) than {100 * slow[0]['timing']['limit']:.0f} % of the "
+                                        f"engine's own time (largest {100 * worst:.0f} %; VOICEMEMOS_EXTRAS_MAX_SHARE).")
             if failed:
                 found["memo_failed"] = (f"{len(failed)} memo(s) could not be transcribed after "
                                         f"{self.cfg.max_attempts} tries ({', '.join(failed[:5])}"

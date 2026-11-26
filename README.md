@@ -75,6 +75,17 @@ A run that finds nothing to do writes only `worker.json` and nothing to its log.
 files to Soniox, tokens and calls to Gemini (counted from version 0.8; not prices, which
 change). `voicememos_status` and `voicememos-mcp check` show the last months.
 
+### What the extra stages take
+
+What is done on top of the engine's own transcription (second reader, voiceprint) may take about a
+tenth of the time the transcription itself took. Each transcript's JSON holds `timing`: the
+engine's time (`primary_s`), each extra stage (`extras_s`), their share (`extras_share`) and
+whether it passed `VOICEMEMOS_EXTRAS_MAX_SHARE` (`over`). A run in which a recording passed the
+limit raises the alert `extras_slow` in `worker.json` (how many recordings, the largest share, no
+title), and `usage.json` sums `primary_s` and `extras_s` per month. The share is absent, never
+zero, when the engine's time is not known: a result saved by an interrupted run, or a memo
+transcribed in parts. It is a measurement and a warning; nothing is skipped because of it.
+
 ## Uncertainty notation
 
 | Markdown | Meaning |
@@ -158,6 +169,22 @@ Add such a voice from one speaker of a memo, e.g.
 Known other voices are never shown as labels; they only stop a speaker from being labelled as
 you when that speaker is as close, or nearly as close, to a known other voice. Run
 `action="identify"` again afterwards; `action="remove_other", name="<name>"` removes one.
+The same from the command line: `voicememos-mcp voiceprint add_other --memo <id> --speaker S1
+--name "<name>"` and `voiceprint remove_other --name "<name>"`.
+
+**A speech synthesiser's voice.** An assistant that answers aloud while you dictate is a voice
+no memo holds alone, so it is registered from a file: save a sample of that voice speaking for
+half a minute or more (at least some six seconds are needed), and run
+
+```bash
+voicememos-mcp voiceprint add_other --file ~/Desktop/claude-tts.m4a --name "Claude TTS"
+```
+
+The file is read where it is, nothing is transcribed or sent, and only the voice's vector is
+kept in `voiceprint.json` beside your own. Running it again with the same file and name replaces
+the earlier vector. Like every known other voice it only stops that voice from being labelled
+as you; it is never shown by name (`add_voice --file` stores it as a named voice instead). Use
+one sample per synthetic voice you listen to.
 
 **Named voices.** Other people can be stored the same way and shown by name:
 `voicememos_voiceprint(action="add_voice", memos=["<id>"], speaker="S2", name="<name>")`. In
@@ -168,17 +195,15 @@ out: the score reaches your own match threshold and is at least 0.10 above what 
 speaker of the recording scores against that name; a speaker who reaches the threshold without
 standing out gets `Name (?)`. Adding the same person from several recordings (same `name`)
 makes the stored voice an average over rooms. `action="remove_voice", name="<name>"` removes
-one. A synthetic voice that a phone reads answers aloud with is in no memo alone, so it is
-stored from a file that holds only that voice:
-`voicememos-mcp voiceprint add_other --file sample.m4a --name "<name>"` (`add_voice` to see it
-named in transcripts). The file is read where it is; nothing is transcribed or sent.
+one.
 
 **Unknown voices of a few seconds.** With `VOICEMEMOS_QUARANTINE_S="5"`, a voice nobody could
 be put to that says less than five seconds in all, in a recording where you were recognised (a
 passer-by, a television), is left out of the rendered text. Its words stay in the JSON file
 with `quarantine: true`, the transcript says how many were left out, and `voicememos_status`
 counts them. The rule is the speaker's whole talk and not one stretch, so the short answers of
-someone you are talking with are never set aside.
+someone you are talking with are never set aside. A memo transcribed in parts is left as it
+is: a speaker's number holds within one part only.
 
 The voiceprint is biometric data, and so is every stored voice of another person: store one
 only of somebody who knows. It is stored only in `DATA_DIR/voiceprint.json` (file mode
@@ -244,6 +269,47 @@ Not available from Soniox, so not in the view: overlapping talk and events such 
 and Soniox tidies fillers and colloquial forms, so the view is not a verbatim transcript.
 Pitch is rough on speech through a codec: a word about an octave from the speaker's level is
 folded back, as nearly all such values are tracking errors or creaky voice.
+
+## Tone of voice (optional)
+
+`VOICEMEMOS_TONE=1` (off by default) measures how you sounded in a recording against how you
+usually sound. It is measured, not guessed, and nothing in it names a feeling.
+
+- From the engine's word times: speech rate (syllables per second of speaking) and the share of
+  pauses inside your own turns.
+- From the audio, with Praat (`pip install voicememos-mcp[tone]`, the `praat-parselmouth` package,
+  0.4.7 with wheels for Apple silicon and Python 3.13 checked on 26.11.2026): median pitch and how
+  much it moves, level, jitter and shimmer. Without the package the two figures from the word
+  times are still made and the side file says the rest is missing.
+
+Only your own voice is measured, and only when the voiceprint recognised it firmly: a possible
+match, no voiceprint, or a recording without you yields nothing. Other speakers are never
+measured. A recording that is excluded is never measured, like everything else about it.
+
+Each figure is held against your own baseline: the median of the 30 recordings before this one
+that have it. What is written is the deviation in robust units, not the raw figure, since a
+microphone or a car moves the raw figures more than a mood does. Until five earlier recordings
+exist there is no deviation and no line.
+
+- `<transcript>.tone.json` beside the transcript's JSON: recording id and time, how many
+  recordings the baseline had, the deviations, and the words chosen. No raw figure, no word.
+- One line in the transcript's header: `[sävy: nopea, korkea, vähän taukoja]`, or
+  `[sävy: tavallinen]` when nothing stands out by a robust unit or more. The transcript's own text
+  is byte for byte what it is without the setting.
+- `DATA_DIR/tone.json` (mode 600) keeps the raw figures the baseline is made of.
+
+At most two minutes of your speech are analysed per recording, and the time is counted among the
+extra stages (see [What the extra stages take](#what-the-extra-stages-take)). It applies to
+recordings transcribed after it is turned on; a memo transcribed in parts gets none. Programs
+that read the transcripts (Vipu) can read the side files as a series.
+
+**Not built: a model's guess of the feeling.** A second layer, emotion2vec+ large (an MLX
+conversion for Apple silicon) writing `[tunne?: …]`, always with a question mark, is left
+unbuilt on purpose. It would need the model on disk (about 1.2 GB for the large model with its
+runtime, to be measured before the choice; the owner's Mac mini had 11 GB free on 26.11.2026), a
+setting of its own that is off by default, the same owner-only rule and time limit as above, and
+first of all a check by the owner on their own Finnish recordings: no measurement of that model on
+Finnish speech was found, so its guesses would be of unknown worth until the owner has looked.
 
 ## Recordings from elsewhere
 
@@ -538,12 +604,14 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_LOG_MAX_MB` | `5` | size at which a worker log is set aside as `*.1`; `0` = never |
 | `VOICEMEMOS_EXCLUDE_FOLDERS` | | Voice Memos folders hidden from everything |
 | `VOICEMEMOS_EXCLUDE_TITLE_REGEX` | | titles hidden from everything |
+| `VOICEMEMOS_EXTRAS_MAX_SHARE` | `0.10` | the extra stages' time against the engine's own, above which `extras_slow` is raised; `0` = no limit |
 | `VOICEMEMOS_SKIP_TITLE_KEYWORD` | `notranscript` | memos with this word in the title are listed but never transcribed |
 | `VOICEMEMOS_MARKERS` | `idea=Idea,task=Task,...` | spoken words that tag a sentence; `*` accepts inflected forms (`question*=Question`) |
 | `VOICEMEMOS_MARKER_WAKE` | | wake word required before a marker word, e.g. `dictate*`; empty = marker word alone |
 | `VOICEMEMOS_MARKER_END` | | end word after the wake word that closes a longer marker, e.g. `end` |
 | `VOICEMEMOS_DIARIZATION` | `1` | separate speakers in conversations |
 | `VOICEMEMOS_VOICEPRINT_NAME` | | your name, shown when the voiceprint recognises you |
+| `VOICEMEMOS_TONE` | `0` | measure your own voice against your own baseline (see [Tone of voice](#tone-of-voice-optional)) |
 | `VOICEMEMOS_SECOND_READER` | | `gemini` = second reading for every new memo, `gemini-low` = only for memos with low certainty |
 | `VOICEMEMOS_SECOND_READER_MODEL` | `gemini-4-argon` | |
 | `VOICEMEMOS_SECOND_READER_MAX_MIN` | `60` | longer recordings are read in parts |
@@ -562,6 +630,13 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 
 Excluded memos are never transcribed, and the MCP tools cannot see them, not even their
 titles.
+
+Patient conversations are outside this package's scope, and the exclusion is how that is held:
+a recording in a folder named in `VOICEMEMOS_EXCLUDE_FOLDERS` (or with a title that matches
+`VOICEMEMOS_EXCLUDE_TITLE_REGEX`) is never sent to an engine, never written, never listed. The
+package has no notion of a patient of its own: it holds only for the folders the setting names.
+On the owner's Mac mini the setting was empty on 26.11.2026 (checked), so nothing is excluded
+there until a folder is named; that is the owner's setting to make.
 
 ## MCP tools
 
@@ -601,6 +676,7 @@ voicememos-mcp transcribe-file memo.m4a --threshold 0.6 --threshold 0.8   # cali
 voicememos-mcp second-read --since 2026-01-01 --limit 20   # add the second reader
 voicememos-mcp report                        # compare readers per language
 voicememos-mcp voiceprint status             # enrollment state and suggestions
+voicememos-mcp voiceprint add_other --file tts.m4a --name "Claude TTS"   # a synthesiser's voice as "not me"
 voicememos-mcp launchd-plist                 # print the launchd job definition
 voicememos-mcp redact plan --memo ID --from-ms 6795000 --to-ms 7137000   # see below
 voicememos-mcp annotate speakers prosody --memo 1a2b3c4d   # own speaker split and measurements for one transcript

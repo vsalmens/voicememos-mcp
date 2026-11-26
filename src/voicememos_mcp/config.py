@@ -79,7 +79,9 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_LAUNCHD_LABEL": "local.voicememos-mcp.sync",
     "SONIOX_BASE_URL": "https://api.soniox.com",
     "SONIOX_MODEL": "stt-async-v6",
+    "VOICEMEMOS_EXTRAS_MAX_SHARE": "0.10",  # extra stages (second reader, voiceprint, tone) against the engine's own time
     "VOICEMEMOS_DIARIZATION": "1",
+    "VOICEMEMOS_TONE": "0",               # the owner's own voice against their own baseline (tone.py); measured, local
     "VOICEMEMOS_VOICEPRINT_NAME": "",
     "VOICEMEMOS_VOICEPRINT_MODEL": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced",
     "VOICEMEMOS_SECOND_READER": "",
