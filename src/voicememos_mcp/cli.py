@@ -101,6 +101,55 @@ def cmd_second_read(args) -> int:
     return 0
 
 
+def cmd_annotate(args) -> int:
+    """Optional passes over existing transcripts: the own speaker split, the measurements per
+    word, a third listening of the disputed spots. Prints ids and counts, never a word."""
+    from .worker import Worker
+
+    cfg = load_config()
+    if args.queue:
+        from .tools import ToolError, Tools
+
+        since = args.since or ("1970-01-01" if not args.memo else None)
+        try:
+            print(json.dumps(Tools(cfg).annotate(args.what, args.memo, since, args.until, args.redo, args.limit,
+                                                 args.model), indent=1))
+        except ToolError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        return 0
+    summary = Worker(cfg).run_annotate(args.what, only=args.memo, since=args.since, until=args.until,
+                                       limit=args.limit, redo=args.redo, model=args.model)
+    for item in summary.get("items", []):
+        done = json.dumps(item["done"], ensure_ascii=False) if item.get("done") else (item.get("error") or "")
+        print(f"{(item.get('recorded') or '')[:16]}  {item['short_id']}  {item['status']}  {done}")
+    if not summary.get("ok"):
+        print(summary.get("error"), file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_export(args) -> int:
+    """Print one transcript in another format (nothing is stored)."""
+    from .tools import ToolError, Tools
+
+    try:
+        out = Tools(load_config()).read(args.memo, args.format, args.threshold, 0, 100000)
+        chunks = [out.get("text") or ""]
+        while out.get("next_offset"):
+            out = Tools(load_config()).read(args.memo, args.format, args.threshold, out["next_offset"], 100000)
+            chunks.append(out.get("text") or "")
+    except ToolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    text = "".join(chunks)
+    if args.out:
+        Path(args.out).expanduser().write_text(text, encoding="utf-8")
+    else:
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    return 0
+
+
 def cmd_import(args) -> int:
     """Copy (or move) recordings made elsewhere into the import folder, with a metadata sidecar.
 
@@ -218,8 +267,24 @@ def cmd_voiceprint(args) -> int:
     from .tools import ToolError, Tools
 
     cfg = load_config()
+    if args.file:
+        # A file that holds one other voice alone (a speech synthesiser's sample): read here, by the
+        # user's own command, since the file is theirs and no recording of the library is touched.
+        from .worker import Worker
+
+        name = (args.name or "").strip()
+        if args.action not in ("add_other", "add_voice") or not name or len(name) > 40 or "*" in name or ":" in name:
+            print("error: --file goes with add_other or add_voice and a --name", file=sys.stderr)
+            return 2
+        try:
+            result = Worker(cfg).add_other_voice_file(Path(args.file), name, show=args.action == "add_voice")
+        except Exception as exc:  # noqa: BLE001 - said to the user, nothing was changed
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(result, ensure_ascii=False, indent=1))
+        return 0
     try:
-        result = Tools(cfg).voiceprint(args.action, args.memo, args.since, args.until, args.name)
+        result = Tools(cfg).voiceprint(args.action, args.memo, args.since, args.until, args.name, args.speaker)
     except ToolError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -437,11 +502,32 @@ def main(argv: list[str] | None = None) -> int:
                    help="hand the request to the launchd worker (use when this shell lacks Full Disk Access)")
 
     p = sub.add_parser("voiceprint", help="status, enroll or identify the owner's voice (enroll/identify run in the worker)")
-    p.add_argument("action", choices=["status", "enroll", "identify"])
+    p.add_argument("action", choices=["status", "enroll", "identify", "add_other", "remove_other", "add_voice",
+                                      "remove_voice"])
     p.add_argument("--memo", action="append", help="memo id (repeatable)")
     p.add_argument("--since")
     p.add_argument("--until")
-    p.add_argument("--name", help="name to show for the owner")
+    p.add_argument("--name", help="name to show for the owner; for add_voice / add_other the other person's")
+    p.add_argument("--speaker", help="add_voice / add_other: the speaker label in that memo (S2)")
+    p.add_argument("--file", help="add_voice / add_other: an audio file that holds only that voice, instead of a memo")
+
+    p = sub.add_parser("annotate", help="optional passes over existing transcripts: the own speaker split, "
+                                        "measurements per word, a third listening of disputed spots")
+    p.add_argument("what", nargs="+", choices=["speakers", "prosody", "adjudicate"])
+    p.add_argument("--memo", action="append", help="only this memo id (repeatable)")
+    p.add_argument("--since", help="memos recorded on or after YYYY-MM-DD")
+    p.add_argument("--until", help="memos recorded on or before YYYY-MM-DD")
+    p.add_argument("--limit", type=int, help="at most N memos")
+    p.add_argument("--redo", action="store_true", help="do a pass again even if it has been done")
+    p.add_argument("--model", help="adjudicate: model id (default VOICEMEMOS_ADJUDICATOR_MODEL)")
+    p.add_argument("--queue", action="store_true",
+                   help="hand the request to the launchd worker (use when this shell lacks Full Disk Access)")
+
+    p = sub.add_parser("export", help="print one transcript as WebVTT, TEI or the conversation-analysis view")
+    p.add_argument("memo", help="memo id")
+    p.add_argument("--format", choices=["vtt", "tei", "ca", "markdown", "text"], default="vtt")
+    p.add_argument("--threshold", type=float, help="confidence threshold for the marks (default from config)")
+    p.add_argument("--out", help="write to this file instead of standard output")
 
     p = sub.add_parser("report", help="compare the readers, per language; writes OUTPUT_DIR/_reports/")
     p.add_argument("--since")
@@ -492,7 +578,8 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {None: cmd_serve, "serve": cmd_serve, "sync": cmd_sync, "check": cmd_check,
                 "transcribe-file": cmd_transcribe_file, "launchd-plist": cmd_launchd_plist,
                 "second-read": cmd_second_read, "report": cmd_report, "voiceprint": cmd_voiceprint,
-                "import": cmd_import, "plaud": cmd_plaud, "redact": cmd_redact}
+                "import": cmd_import, "plaud": cmd_plaud, "redact": cmd_redact, "annotate": cmd_annotate,
+                "export": cmd_export}
     return handlers[args.command](args)
 
 

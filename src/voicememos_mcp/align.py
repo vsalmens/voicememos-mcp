@@ -79,7 +79,8 @@ def dominant_language(words: list[dict], min_share: float = 0.8) -> str:
     return lang if count / sum(langs.values()) >= min_share else "mixed"
 
 
-READER_FIELDS = ("alts", "span", "in_span", "insert_after", "insert_before", "basis", "flag", "reader_unsure")
+READER_FIELDS = ("alts", "span", "in_span", "insert_after", "insert_before", "basis", "flag", "reader_unsure",
+                 "adj", "adj_before", "adj_after")  # a third listening belongs to the reading it judged
 
 
 def strip_reader(primary: list[dict]) -> list[dict]:

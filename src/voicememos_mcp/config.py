@@ -88,6 +88,17 @@ DEFAULTS: dict[str, str] = {
     "VOICEMEMOS_SECOND_READER_CHUNK_MIN": "30",
     "VOICEMEMOS_SECOND_READER_MIN_AGREEMENT": "0.1",
     "VOICEMEMOS_SECOND_READER_MAX_TOTAL_MIN": "600",  # longer memos get no automatic second reading
+    # A third listening of the spots where the readers disagree (adjudicate.py): "1" = after every
+    # second reading; on request with `voicememos-mcp annotate adjudicate` either way.
+    "VOICEMEMOS_ADJUDICATE": "0",
+    "VOICEMEMOS_ADJUDICATOR_MODEL": "gemini-4-argon",
+    "VOICEMEMOS_ADJUDICATE_MAX": "60",  # spots per recording, the most doubtful first
+    # Local, with the voiceprint's model and numpy (pip install 'voicememos-mcp[voiceprint]'):
+    "VOICEMEMOS_SPEAKER_SPLIT": "0",  # divide and join the engine's speakers by voice (diarize.py)
+    "VOICEMEMOS_PROSODY": "0",  # measure loudness, pitch and tempo per word (prosody.py)
+    # With a voiceprint: an unknown voice that says less than this many seconds in a recording
+    # where the owner was recognised is left out of the rendered text (kept in the JSON). 0 = off.
+    "VOICEMEMOS_QUARANTINE_S": "0",
     "VOICEMEMOS_ROAM_ENABLED": "0",
     "VOICEMEMOS_ROAM_BACKFILL": "0",
     "ROAM_GRAPH": "",

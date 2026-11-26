@@ -52,6 +52,8 @@ def _summary(memo: dict) -> dict:
         "markers": len(transcript.get("markers") or []),
         "speakers": transcript.get("speakers") or None,
         "voiceprint": transcript.get("voiceprint") or None,
+        **({"quarantined_words": transcript["quarantined"]} if transcript.get("quarantined") else {}),
+        **({"annotations": transcript["annotations"]} if transcript.get("annotations") else {}),
     }
 
 
@@ -175,6 +177,9 @@ class Tools:
             "health": worker.get("health"),
             # Sent to the engines per calendar month (audio minutes, tokens), newest first.
             "usage": self.store.recent_usage(),
+            # Words of unknown voices left out of the rendered text (VOICEMEMOS_QUARANTINE_S); in the JSON files.
+            "quarantine": {"memos": sum(1 for m in memos if (m.get("transcript") or {}).get("quarantined")),
+                           "words": sum((m.get("transcript") or {}).get("quarantined") or 0 for m in memos)},
             "warnings": warnings,
         }
 
@@ -216,8 +221,25 @@ class Tools:
                                                       self.cfg.timestamp_every_s))
         elif format == "markdown":
             text = render_markdown(data, thr, self.cfg.run_min, self.cfg.pause_ms, self.cfg.timestamp_every_s)
+        elif format == "ca":
+            from . import ca
+
+            lines = ca.render(data.get("words", []), thr, data.get("speakers"), redactions=data.get("redactions"))
+            measured = bool(data.get("prosody")) and not data["prosody"].get("error")
+            note = ca.LEGEND if measured else (
+                ca.LEGEND + " This recording has not been measured (voicememos_annotate with 'prosody'), so "
+                "only the pauses and the gaps between turns are shown.")
+            text = f"> {note}\n\n" + "\n".join(lines)
+        elif format == "vtt":
+            from . import export
+
+            text = export.webvtt(data, thr)
+        elif format == "tei":
+            from . import export
+
+            text = export.tei(data, thr)
         else:
-            raise ToolError("format must be 'markdown', 'text' or 'json'")
+            raise ToolError("format must be 'markdown', 'text', 'json', 'ca', 'vtt' or 'tei'")
         offset = max(0, int(offset))
         max_chars = max(1000, min(int(max_chars), 100000))
         chunk = text[offset: offset + max_chars]
@@ -316,6 +338,31 @@ class Tools:
         return {"languages": summary, "report_file": paths["markdown"],
                 "samples": {lang: group["samples"][:5] for lang, group in report["languages"].items()}}
 
+    ANNOTATIONS = ("speakers", "prosody", "adjudicate")
+
+    def annotate(self, what: list[str] | str, memos: list[str] | None = None, since: str | None = None,
+                 until: str | None = None, redo: bool = False, limit: int | None = None,
+                 model: str | None = None) -> dict:
+        """Queue optional passes over existing transcripts (see ``Worker.annotate_memo``)."""
+        what = [what] if isinstance(what, str) else list(what or [])
+        what = list(dict.fromkeys(w.strip().lower() for w in what if w and w.strip()))
+        if not what or any(w not in self.ANNOTATIONS for w in what):
+            raise ToolError("what must be one or more of: " + ", ".join(self.ANNOTATIONS))
+        memos = [m for m in (memos or []) if m and m.strip()]
+        since, until = _check_date(since, "since"), _check_date(until, "until")
+        if not memos and not since and not until:
+            raise ToolError("give memo ids, or a date range (since/until)")
+        if model and not re.fullmatch(r"[A-Za-z0-9._-]{3,80}", model):
+            raise ToolError("invalid model id")
+        request = {"action": "annotate", "what": what, "memos": [self._find(m)["id"] for m in memos],
+                   "since": since, "until": until, "redo": bool(redo), "model": model,
+                   "limit": max(1, int(limit)) if limit else None}
+        self.store.ensure_dirs()
+        job_id = self.store.enqueue(request)
+        return {"job_id": job_id, "status": "queued", "worker": self._kick_worker(),
+                "hint": "check progress with voicememos_transcribe_status; read the result with "
+                        "voicememos_read (format 'ca' shows the measurements)"}
+
     def voiceprint(self, action: str = "status", memos: list[str] | None = None, since: str | None = None,
                    until: str | None = None, name: str | None = None, speaker: str | None = None) -> dict:
         from .voiceprint import Voiceprint, suggest_enrollment
@@ -346,28 +393,49 @@ class Tools:
                 raise ToolError("no voiceprint enrolled yet (action='enroll')")
             request = {"action": "identify", "memos": [self._find(m)["id"] for m in memos],
                        "since": since, "until": until}
-        elif action in ("add_other", "remove_other"):
+        elif action in ("add_other", "remove_other", "add_voice", "remove_voice"):
             who = (name or "").strip()
-            if not who or len(who) > 60:
-                raise ToolError("give the other person's name (only used in status and logs)")
+            shown = action == "add_voice"
+            # A named voice becomes a speaker label, which other programs read as "**Name:**".
+            if not who or len(who) > (40 if shown else 60) or (shown and (re.search(r"[*:\n]", who)
+                                                                          or re.fullmatch(r"S\d+\w?", who))):
+                raise ToolError("give the person's name (at most 40 characters, no '*' or ':', not S1-like)"
+                                if shown else "give the other person's name (only used in status and logs)")
             if not self.store.voiceprint_path.exists():
                 raise ToolError("enroll your own voiceprint first (action='enroll')")
-            if action == "remove_other":
+            if action in ("remove_other", "remove_voice"):
                 request = {"action": "remove_other", "memos": [], "name": who}
             else:
                 if len(memos) != 1:
                     raise ToolError("give exactly one memo id")
-                spk = (speaker or "").strip().upper().removeprefix("S") or None
-                if spk is not None and not spk.isdigit():
-                    raise ToolError("speaker must look like S1, S2, ...")
+                spk = self._speaker_key(memos[0], speaker)
                 request = {"action": "add_other", "memos": [self._find(memos[0])["id"]], "name": who,
-                           "speaker": spk}
+                           "speaker": spk, "show": shown}
         else:
-            raise ToolError("action must be 'status', 'enroll', 'identify', 'add_other' or 'remove_other'")
+            raise ToolError("action must be 'status', 'enroll', 'identify', 'add_other', 'remove_other', "
+                            "'add_voice' or 'remove_voice'")
         self.store.ensure_dirs()
         job_id = self.store.enqueue(request)
         return {"job_id": job_id, "status": "queued", "worker": self._kick_worker(),
                 "hint": "check progress with voicememos_transcribe_status"}
+
+    def _speaker_key(self, memo: str, speaker: str | None) -> str | None:
+        """The engine's key of the speaker a label names in that memo's transcript: a label as
+        the transcript shows it (S2, S1b, a name), or the number alone (2) as before."""
+        label = (speaker or "").strip()
+        if not label:
+            return None
+        transcript = (self._find(memo).get("transcript") or {})
+        data = self._load_transcript(transcript["json"]) if transcript.get("json") else None
+        speakers = (data or {}).get("speakers") or {}
+        for key, value in speakers.items():
+            if str(value.get("label", "")).casefold() == label.casefold():
+                return key
+        number = label.upper().removeprefix("S")
+        if number in speakers or (number.isdigit() and not speakers):
+            return number
+        raise ToolError(f"no speaker '{label}' in that memo (speakers: "
+                        + (", ".join(str(v.get("label")) for v in speakers.values()) or "none") + ")")
 
     def _kick_worker(self) -> str:
         mode = self.cfg.get("VOICEMEMOS_WORKER")

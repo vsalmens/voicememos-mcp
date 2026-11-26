@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import align, notation, roam, segment
-from .audio import cut_audio, find_tool, prepare_audio
+from .audio import cut_audio, find_tool, prepare_audio, sound_only
 from .config import Config
 from .library import LibraryError, Memo, is_excluded, probe_duration, read_imports, read_library, skips_transcription
 from .soniox import SonioxUnavailable
@@ -202,8 +202,9 @@ class Worker:
     def __init__(self, cfg: Config, store: Store | None = None, transcriber: Transcriber | None = None,
                  roam_session=None, clock: Callable[[], float] = time.time,
                  second_reader: SecondReader | None = None, embedder=None, audio_loader=None,
-                 audio_cutter: Callable = cut_audio, plaud_client=None):
+                 audio_cutter: Callable = cut_audio, plaud_client=None, adjudicator=None):
         self.cfg = cfg
+        self._adjudicator = adjudicator
         self._plaud_client = plaud_client
         self.store = store or Store(cfg.data_dir, cfg.output_dir, cfg.folder_dirs)
         self.store.stamp_every_s = cfg.timestamp_every_s
@@ -264,13 +265,18 @@ class Worker:
         self._count(soniox_audio_min=minutes, soniox_files=1)
         return tokens
 
-    def _read_second(self, reader: SecondReader, audio: Path) -> dict:
-        result = reader(audio)
+    def _count_gemini(self, result: dict) -> int:
         usage = result.get("usage") or {}
         self._count(gemini_calls=1, gemini_tokens=usage.get("totalTokenCount") or 0,
                     gemini_input_tokens=usage.get("promptTokenCount") or 0,
                     gemini_output_tokens=(usage.get("candidatesTokenCount") or 0)
                     + (usage.get("thoughtsTokenCount") or 0))
+        return usage.get("totalTokenCount") or 0
+
+    def _read_second(self, reader: SecondReader, audio: Path) -> dict:
+        with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+            result = reader(sound_only(audio, Path(tmp)))
+        self._count_gemini(result)
         return result
 
     # ------------------------------------------------------------------ state
@@ -442,6 +448,123 @@ class Worker:
             record["error"] = str(exc)[:300]
             return words, record
 
+    # ------------------------------------------------------------------ third listening
+    def adjudicator(self, model: str | None = None):
+        """``(clip, prompt) -> {"text", "usage", "model"}``: the model that hears a disputed spot."""
+        if self._adjudicator is not None:
+            return self._adjudicator
+        from .gemini import Gemini
+
+        key = self.cfg.secret("GEMINI_API_KEY")
+        if not key:
+            raise RuntimeError("GEMINI_API_KEY is not set (environment or Keychain)")
+        client = Gemini(key, model or self.cfg.get("VOICEMEMOS_ADJUDICATOR_MODEL"))
+        return lambda clip, prompt: client.transcribe(clip, prompt, json_mode=True)
+
+    def _adjudicate(self, audio: Path, memo: Memo, words: list[dict], model: str | None = None) -> tuple[list[dict], dict]:
+        """A third listening of the spots where the readers disagree (``adjudicate.py``).
+        Returns (words, reader record). Never raises; a spot that fails is left as it was."""
+        from . import adjudicate
+
+        record: dict = {"role": "adjudicator", "provider": "gemini", "created": now_iso()}
+        words = adjudicate.clear(words)
+        try:
+            found = adjudicate.disputes(words)
+            chosen = adjudicate.select(found, int(self.cfg.get("VOICEMEMOS_ADJUDICATE_MAX") or 0))
+            record.update(spots=len(found), asked=len(chosen))
+            if not chosen:
+                record["error"] = "skipped: the readers do not disagree anywhere"
+                return words, record
+            judge = self.adjudicator(model)
+            tokens, failed, unread, error, name = 0, 0, 0, None, None
+            with tempfile.TemporaryDirectory(prefix="voicememos-spot-") as tmp:
+                for k, spot in enumerate(chosen):
+                    start_s, end_s = adjudicate.clip_bounds(spot)
+                    try:
+                        clip = self._cut_audio(audio, start_s, end_s, Path(tmp) / f"spot{k}{audio.suffix or '.m4a'}")
+                        result = judge(clip, adjudicate.build_prompt(spot, self.cfg.languages))
+                        clip.unlink(missing_ok=True)
+                    except Exception as exc:  # noqa: BLE001 - one refused spot must not lose the others
+                        failed += 1
+                        error = str(exc)[:200]
+                        if failed == k + 1 and failed >= 3:  # nothing has worked: the model or the key
+                            break
+                        continue
+                    tokens += self._count_gemini(result)
+                    name = name or result.get("model")
+                    answer = adjudicate.parse_answer(result.get("text", ""), spot)
+                    if answer is None:
+                        unread += 1
+                    else:
+                        adjudicate.apply(words, spot, answer)
+            record.update(model=name or model or self.cfg.get("VOICEMEMOS_ADJUDICATOR_MODEL"),
+                          usage={"totalTokenCount": tokens}, failed=failed, unreadable_answers=unread,
+                          **adjudicate.tally(words))
+            if not record["judged"]:
+                record["error"] = f"no spot was judged: {error or 'the answers could not be read'}"
+                log.warning("Third listening of %s gave nothing: %s", memo.id, record["error"])
+        except Exception as exc:  # noqa: BLE001 - the transcript must survive
+            log.exception("Third listening failed for %s", memo.id)
+            record["error"] = str(exc)[:300]
+        return words, record
+
+    # ------------------------------------------------------------------ speakers and measurements
+    def _split_speakers(self, audio: Path, words: list[dict]) -> tuple[list[dict], dict | None]:
+        """Divide and join the engine's speakers by voice (``diarize.py``). Returns (words,
+        summary); the summary is None when the engine found one speaker, which is left alone: a
+        dictation must not become two people because the room changed. Never raises."""
+        from . import diarize
+
+        words = diarize.restore(words)
+        if len({str(w.get("speaker")) for w in words if w.get("speaker") not in (None, "")}) < 2:
+            return words, None
+        try:
+            words, summary = diarize.split(self.load_audio(audio), words, self.embedder())
+            return words, {**summary, "model": self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL"), "created": now_iso()}
+        except Exception as exc:  # noqa: BLE001 - the transcript must survive
+            log.exception("Speaker split failed")
+            return words, {"error": str(exc)[:200], "created": now_iso()}
+
+    def _measure(self, audio: Path, words: list[dict]) -> tuple[list[dict], dict]:
+        """Loudness, pitch and tempo per word (``prosody.py``). Never raises."""
+        from . import prosody
+
+        try:
+            words, summary = prosody.measure(self.load_audio(audio), words)
+            return words, {**summary, "created": now_iso()}
+        except Exception as exc:  # noqa: BLE001 - the transcript must survive
+            log.exception("Measuring the words failed")
+            return words, {"error": str(exc)[:200], "created": now_iso()}
+
+    def _quarantine(self, words: list[dict], speakers: dict) -> tuple[list[dict], dict | None]:
+        from .voiceprint import quarantine
+
+        try:
+            max_s = float(self.cfg.get("VOICEMEMOS_QUARANTINE_S") or 0)
+        except ValueError:
+            max_s = 0.0
+        return quarantine(words, speakers, max_s)
+
+    def _speakers(self, audio: Path, words: list[dict], segments: dict | None,
+                  split: bool) -> tuple[list[dict], dict]:
+        """Who speaks: the optional own split, the voiceprint and names, and what is set aside.
+        Returns (words, the transcript's keys ``speakers``, ``voiceprint``, ``speaker_split``,
+        ``quarantine``; the last two only when there is something to say)."""
+        out: dict = {}
+        if split:
+            words, summary = self._split_speakers(audio, words)
+            if summary is not None:
+                out["speaker_split"] = summary
+        if segments:
+            speakers, voice = self._identify_parts(audio, words, segments["bounds_s"])
+        else:
+            speakers, voice = self._identify(audio, words, notation.speaker_labels(words))
+        words, aside = self._quarantine(words, speakers)
+        if aside:
+            out["quarantine"] = aside
+        out.update(speakers=speakers, voiceprint=voice)
+        return words, out
+
     # ------------------------------------------------------------------ voiceprint
     def embedder(self):
         if isinstance(self._embedder, Exception):  # failed earlier in this run: do not retry per memo
@@ -562,8 +685,37 @@ class Worker:
         Voiceprint(self.store.voiceprint_path).save(result)
         return Voiceprint(self.store.voiceprint_path).summary()
 
-    def add_other_voice(self, memo: Memo, speaker: str | None, name: str) -> dict:
-        """Store a known other person's voice ("not me") from one speaker of a transcribed memo."""
+    def add_other_voice_file(self, path: Path, name: str, show: bool = False) -> dict:
+        """Store a voice from an audio file that holds only that voice: a sample of a speech
+        synthesiser, say, which no memo holds alone. Nothing is transcribed and nothing is sent
+        anywhere; the file is read where it is and not copied. The same file and name again
+        replace the stored voice."""
+        from .voiceprint import Voiceprint, other_voice
+
+        store = Voiceprint(self.store.voiceprint_path)
+        data = store.load()
+        if not data:
+            raise RuntimeError("enroll your own voiceprint first")
+        if data.get("model") != self.cfg.get("VOICEMEMOS_VOICEPRINT_MODEL"):
+            raise RuntimeError("the voiceprint was made with another model; enroll again first")
+        path = Path(path).expanduser()
+        if not path.is_file():
+            raise RuntimeError(f"no such file: {path.name}")
+        if any(o.get("name") == name and bool(o.get("show")) != show for o in data.get("others", [])):
+            raise RuntimeError(f"'{name}' is already stored as a {'not-me' if show else 'named'} voice; "
+                               "remove it first or use another name")
+        with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+            samples = self.load_audio(prepare_audio(path, Path(tmp)))
+            voice = other_voice(name, samples, None, None, self.embedder(), show=show)
+        voice.update(memo_id=None, speaker=None, file=path.name)
+        others = [o for o in data.get("others", []) if (o.get("name"), o.get("file")) != (name, path.name)]
+        data["others"] = others + [voice]
+        store.save(data)
+        return store.summary()
+
+    def add_other_voice(self, memo: Memo, speaker: str | None, name: str, show: bool = False) -> dict:
+        """Store a known other person's voice from one speaker of a transcribed memo: "not me"
+        only, or with ``show`` a named voice that speakers are labelled with."""
         from .voiceprint import Voiceprint, other_voice
 
         store = Voiceprint(self.store.voiceprint_path)
@@ -585,8 +737,11 @@ class Worker:
             raise RuntimeError(f"memo {memo.short_id} is not downloaded")
         with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
             samples = self.load_audio(prepare_audio(self._audio_path(memo), Path(tmp)))
-            voice = other_voice(name, samples, transcript.get("words", []), speaker, self.embedder())
+            voice = other_voice(name, samples, transcript.get("words", []), speaker, self.embedder(), show=show)
         voice.update(memo_id=memo.id, speaker=speaker)
+        if any(o.get("name") == name and bool(o.get("show")) != show for o in data.get("others", [])):
+            raise RuntimeError(f"'{name}' is already stored as a {'not-me' if show else 'named'} voice; "
+                               "remove it first or use another name")
         others = [o for o in data.get("others", []) if (o.get("memo_id"), o.get("speaker")) != (memo.id, speaker)]
         data["others"] = others + [voice]
         store.save(data)
@@ -629,6 +784,10 @@ class Worker:
                 return {**item, "status": "failed", "error": "no voiceprint enrolled"}
             if summary.get("result") == "error":
                 return {**item, "status": "failed", "error": summary.get("error")}
+            data["words"], aside = self._quarantine(words, speakers)
+            data.pop("quarantine", None)
+            if aside:
+                data["quarantine"] = aside
             data["speakers"], data["voiceprint"] = speakers, summary
             result = self.store.rewrite_transcript(entry["json"], data, self.cfg.threshold, self.cfg.run_min,
                                                    self.cfg.pause_ms, self.cfg.marker_spec)
@@ -637,6 +796,9 @@ class Worker:
             return {**item, "status": "failed", "error": str(exc)[:300]}
         entry.update(stats=result["stats"], markers=result["markers"], speakers=len(speakers),
                      voiceprint=_vp_short(summary))
+        entry.pop("quarantined", None)
+        if data.get("quarantine"):
+            entry["quarantined"] = data["quarantine"]["words"]
         self.state[memo.id] = entry
         return {**item, "status": "identified", "voiceprint": _vp_short(summary)}
 
@@ -714,8 +876,11 @@ class Worker:
 
     @staticmethod
     def _transcript_info(entry: dict) -> dict:
-        return {k: entry.get(k) for k in ("json", "markdown", "stats", "markers", "at", "language",
+        info = {k: entry.get(k) for k in ("json", "markdown", "stats", "markers", "at", "language",
                                           "second_reader", "speakers", "voiceprint")}
+        # Only where there is something: the snapshot of a library without these stays as it was.
+        info.update({k: entry[k] for k in ("quarantined", "annotations") if entry.get(k)})
+        return info
 
     def _orphans(self, present: set[str]) -> list[dict]:
         """Transcripts whose recording is gone (an import file deleted to save space, a memo
@@ -855,15 +1020,18 @@ class Worker:
             elif self.is_long(memo, words) or self.wants_second_read(words):
                 only_uncertain = self.cfg.get("VOICEMEMOS_SECOND_READER") == "gemini-low"
                 words, second_record = self._apply_second_reader(reader, audio, memo, words, only_uncertain)
-        if segments:
-            speakers, voice = self._identify_parts(audio, words, segments["bounds_s"])
-        else:
-            speakers, voice = self._identify(audio, words, notation.speaker_labels(words))
+        third_record = None
+        if second_record and not second_record.get("error") and self.cfg.flag("VOICEMEMOS_ADJUDICATE"):
+            words, third_record = self._adjudicate(audio, memo, words)
+        words, who = self._speakers(audio, words, segments, self.cfg.flag("VOICEMEMOS_SPEAKER_SPLIT"))
+        speakers, voice = who["speakers"], who["voiceprint"]
         engine = {"provider": "soniox", "model": self.cfg.get("SONIOX_MODEL"),
                   "language_hints": self.cfg.languages}
-        extra = {"language": align.dominant_language(words), "speakers": speakers, "voiceprint": voice,
+        extra = {"language": align.dominant_language(words), **who,
                  "readers": [{"role": "primary", **engine, "created": now_iso()}]
-                 + ([second_record] if second_record else [])}
+                 + ([second_record] if second_record else []) + ([third_record] if third_record else [])}
+        if self.cfg.flag("VOICEMEMOS_PROSODY"):  # after the speakers: the levels are each speaker's own
+            words, extra["prosody"] = self._measure(audio, words)
         if segments:
             extra["segments"] = segments
         result = self.store.write_transcript(
@@ -877,6 +1045,7 @@ class Worker:
         if second_record and not second_record.get("error"):
             result["second_reader"] = {"model": second_record.get("model"),
                                        "agreement": second_record["agreement"]["agreement"]}
+        result.update(self._annotations(extra))
         new_entry = {"fp": fingerprint, "ok": True, "at": now_iso(), "title": memo.title, **result}
         if entry.get("roam"):
             new_entry["roam"] = entry["roam"]
@@ -1036,6 +1205,93 @@ class Worker:
         self.state[memo.id] = entry
         return {**item, "status": "second_read", "agreement": record["agreement"], "markdown": result["markdown"]}
 
+    @staticmethod
+    def _annotations(data: dict) -> dict:
+        """What the state keeps about a transcript's extras (for the library snapshot): the words
+        set aside, and which of the optional passes it has been through."""
+        out: dict = {}
+        if data.get("quarantine"):
+            out["quarantined"] = data["quarantine"]["words"]
+        done = {}
+        split = data.get("speaker_split") or {}
+        if split and not split.get("error"):
+            done["speaker_split"] = {"changed_words": split.get("changed_words", 0)}
+        if data.get("prosody") and not data["prosody"].get("error"):
+            done["prosody"] = True
+        third = next((r for r in data.get("readers") or [] if r.get("role") == "adjudicator" and not r.get("error")), None)
+        if third:
+            done["adjudicated"] = {k: third.get(k) for k in ("judged", "primary", "second", "other", "unclear")}
+        if done:
+            out["annotations"] = done
+        return out
+
+    def annotate_memo(self, memo: Memo, what: list[str], redo: bool = False, model: str | None = None) -> dict:
+        """Run optional passes over an existing transcript, without the primary engine:
+        ``speakers`` (the own speaker split, then the voiceprint and names again), ``prosody``
+        (the measurements per word) and ``adjudicate`` (a third listening of the disputed spots).
+        A pass already done is done again only with ``redo``; the speakers are always done again."""
+        item = {"id": memo.id, "short_id": memo.short_id, "title": memo.title, "recorded": memo.recorded}
+        entry = self.state.get(memo.id, {})
+        if self._excluded(memo) or memo.deleted:
+            return {**item, "status": "skipped"}
+        if not entry.get("ok"):
+            return {**item, "status": "not_transcribed", "error": "transcribe it first"}
+        data = self.store.load_transcript(entry["json"])
+        if data is None:
+            return {**item, "status": "failed", "error": "transcript file missing"}
+        if not memo.local or not memo.filename:
+            return {**item, "status": "not_downloaded"}
+        what = list(dict.fromkeys(what))
+        done: dict = {}
+        try:
+            words = data.get("words", [])
+            with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+                audio = prepare_audio(self._audio_path(memo), Path(tmp))
+                if "adjudicate" in what:
+                    readers = data.get("readers") or []
+                    if not any(r.get("role") == "second" and not r.get("error") for r in readers):
+                        done["adjudicate"] = "skipped: no second reading (voicememos_second_read first)"
+                    elif not redo and any(r.get("role") == "adjudicator" and not r.get("error") for r in readers):
+                        done["adjudicate"] = "already done"
+                    else:
+                        words, record = self._adjudicate(audio, memo, words, model)
+                        data["readers"] = [r for r in readers if r.get("role") != "adjudicator"] + [record]
+                        done["adjudicate"] = record.get("error") or {
+                            k: record.get(k) for k in ("spots", "asked", "judged", "primary", "second", "other", "unclear")}
+                if "speakers" in what:
+                    words, who = self._speakers(audio, words, data.get("segments"), split=True)
+                    for key in ("speaker_split", "quarantine"):
+                        data.pop(key, None)
+                    data.update(who)
+                    split = who.get("speaker_split")
+                    done["speakers"] = ("one speaker: left as it is" if split is None else split.get("error") or {
+                        "engine_speakers": split.get("engine_speakers"), "speakers": split.get("speakers"),
+                        "changed_words": split.get("changed_words")})
+                    if data.get("prosody") and "prosody" not in what:
+                        what.append("prosody")  # the levels are each speaker's own: measure again
+                if "prosody" in what:
+                    had = data.get("prosody") and not data["prosody"].get("error")
+                    if had and not redo and "speakers" not in what:
+                        done["prosody"] = "already done"
+                    else:
+                        words, data["prosody"] = self._measure(audio, words)
+                        done["prosody"] = data["prosody"].get("error") or {
+                            "measured_words": data["prosody"].get("measured_words")}
+            data["words"] = words
+            result = self.store.rewrite_transcript(entry["json"], data, self.cfg.threshold, self.cfg.run_min,
+                                                   self.cfg.pause_ms, self.cfg.marker_spec)
+        except Exception as exc:  # noqa: BLE001 - a failing memo must not block the queue
+            log.exception("Annotating %s failed", memo.id)
+            return {**item, "status": "failed", "error": str(exc)[:300]}
+        entry.update(stats=result["stats"], markers=result["markers"], speakers=len(data.get("speakers") or {}))
+        if "speakers" in what and data.get("voiceprint"):
+            entry["voiceprint"] = _vp_short(data["voiceprint"])
+        for key in ("quarantined", "annotations"):
+            entry.pop(key, None)
+        entry.update(self._annotations(data))
+        self.state[memo.id] = entry
+        return {**item, "status": "annotated", "done": done, "markdown": result["markdown"]}
+
     def realign_memo(self, memo: Memo) -> dict:
         """Re-align the stored second reading with the current rules; no new API call."""
         item = {"id": memo.id, "short_id": memo.short_id, "title": memo.title, "recorded": memo.recorded}
@@ -1130,7 +1386,8 @@ class Worker:
             action = request.get("action")
             if action == "add_other":
                 for memo in targets:
-                    job["voiceprint"] = self.add_other_voice(memo, request.get("speaker"), request["name"])
+                    job["voiceprint"] = self.add_other_voice(memo, request.get("speaker"), request["name"],
+                                                             show=bool(request.get("show")))
             elif action == "remove_other":
                 job["voiceprint"] = self.remove_other_voice(request["name"])
             else:
@@ -1166,7 +1423,7 @@ class Worker:
             self._run_enroll_job(job, request, memos)
             return job
         targets = self._resolve_request(request, memos)
-        if action == "identify":
+        if action in ("identify", "annotate"):
             targets = [m for m in targets if self.state.get(m.id, {}).get("ok")]
         if request.get("action") == "second_read":
             targets = [m for m in targets if self.state.get(m.id, {}).get("ok")]
@@ -1181,6 +1438,9 @@ class Worker:
         for memo in targets:
             if action == "identify":
                 item = self.identify_memo(memo)
+            elif action == "annotate":
+                item = self.annotate_memo(memo, list(request.get("what") or []), bool(request.get("redo")),
+                                          request.get("model"))
             elif second and request.get("realign"):
                 item = self.realign_memo(memo)
             elif second:
@@ -1190,6 +1450,8 @@ class Worker:
                 item = self.transcribe_memo(memo, force=bool(request.get("redo")), push_roam=push)
             job["items"].append({k: item.get(k) for k in ("short_id", "title", "recorded", "status",
                                                          "error", "markdown")})
+            if item.get("done"):
+                job["items"][-1]["done"] = item["done"]
             job["done"] += 1
             job["failed"] += item["status"] == "failed"
             if second and item.get("agreement") is not None:
@@ -1256,6 +1518,28 @@ class Worker:
                         items.append(self.realign_memo(memo))
                     else:
                         items.append(self.second_read_memo(memo, model, redo, only_uncertain))
+                    self._save_state()
+                self.store.write_library(self._snapshot(memos))
+                return {"ok": True, "items": items}
+        except Busy as exc:
+            return {"ok": False, "error": str(exc)}
+        except (LibraryError, StateError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def run_annotate(self, what: list[str], only: list[str] | None = None, since: str | None = None,
+                     until: str | None = None, limit: int | None = None, redo: bool = False,
+                     model: str | None = None) -> dict:
+        """``annotate_memo`` for a set of transcripts (synchronously, under the worker lock)."""
+        self.store.ensure_dirs()
+        try:
+            with single_instance(self.store.data_dir / "worker.lock"):
+                self._load_state()
+                memos = self._memos()
+                request = {"memos": only or [], "since": since, "until": until, "all": not (only or since or until)}
+                targets = [m for m in self._resolve_request(request, memos) if self.state.get(m.id, {}).get("ok")]
+                items = []
+                for memo in targets[: limit or None]:
+                    items.append(self.annotate_memo(memo, what, redo, model))
                     self._save_state()
                 self.store.write_library(self._snapshot(memos))
                 return {"ok": True, "items": items}

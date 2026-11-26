@@ -373,3 +373,37 @@ def test_realign_uses_stored_text_without_api_calls(cfg, fake):
     assert summary["items"][0]["status"] == "rejected"
     md = next(cfg.output_dir.rglob("*morning-walk_aaaa1111.md")).read_text()
     assert "{" not in md.split("## Transcript", 1)[1]
+
+
+def test_an_ogg_file_with_a_second_stream_is_sent_as_its_sound_alone(tmp_path):
+    import shutil
+    import subprocess
+
+    import pytest
+
+    from voicememos_mcp import audio
+
+    def page(serial, flags, body=b"x"):
+        return b"OggS\0" + bytes([flags]) + b"\0" * 8 + serial + b"\0" * 8 + bytes([1, len(body)]) + body
+
+    one = tmp_path / "one.ogg"
+    one.write_bytes(page(b"aaaa", 2) + page(b"aaaa", 0) * 3)
+    two = tmp_path / "two.ogg"
+    two.write_bytes(page(b"aaaa", 2) + page(b"bbbb", 2) + page(b"aaaa", 0) + page(b"bbbb", 0))
+    assert audio.ogg_streams(one) == 1 and audio.ogg_streams(two) == 2 and audio.ogg_streams(tmp_path / "none") == 0
+    assert audio.sound_only(one, tmp_path) == one  # nothing to leave out
+    m4a = tmp_path / "x.m4a"
+    m4a.write_bytes(two.read_bytes())
+    assert audio.sound_only(m4a, tmp_path) == m4a
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg is not installed")
+    real = tmp_path / "real.ogg"
+    made = subprocess.run([ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=300:duration=1",
+                           "-f", "lavfi", "-i", "sine=frequency=500:duration=1", "-map", "0:a", "-map", "1:a",
+                           "-c:a", "libopus", str(real)], capture_output=True)
+    if made.returncode != 0:
+        pytest.skip("this ffmpeg cannot write Opus")
+    assert audio.ogg_streams(real) == 2
+    out = audio.sound_only(real, tmp_path)
+    assert out != real and audio.ogg_streams(out) == 1

@@ -62,6 +62,41 @@ def prepare_audio(path: Path, workdir: Path) -> Path:
     raise RuntimeError(f"Could not convert {path.name} to m4a ({detail})")
 
 
+def ogg_streams(path: Path) -> int:
+    """How many streams an Ogg file starts with (each begins with a page of its own, flagged as
+    the beginning of a stream, before any data page). 0 when the file is not Ogg."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(65536)
+    except OSError:
+        return 0
+    serials = set()
+    at = head.find(b"OggS")
+    while at != -1 and at + 27 <= len(head):
+        if head[at + 5] & 0x02:
+            serials.add(head[at + 14: at + 18])
+        at = head.find(b"OggS", at + 4)
+    return len(serials)
+
+
+def sound_only(path: Path, workdir: Path) -> Path:
+    """The file itself, or for an Ogg file with a second stream beside the sound (a Plaud
+    recorder writes one of zeros) a copy in ``workdir`` with the sound stream alone. Gemini
+    refuses some such files whole ("the file or media data is empty, corrupted, or malformed":
+    seen 26.11.2026 on an 18-second recording, which it read once the other stream was left out).
+    The sound is copied, not encoded again. Without ffmpeg, or if the copy fails, the file itself."""
+    if path.suffix.lower() not in (".ogg", ".opus", ".oga") or ogg_streams(path) < 2:
+        return path
+    ffmpeg = find_tool("ffmpeg")
+    if not ffmpeg:
+        return path
+    out = workdir / (path.stem + ".sound" + path.suffix)
+    result = subprocess.run([ffmpeg, "-nostdin", "-loglevel", "error", "-y", "-i", str(path),
+                             "-vn", "-map", "0:a:0", "-c:a", "copy", str(out)],
+                            capture_output=True, text=True, check=False)
+    return out if out.exists() and out.stat().st_size > 0 else path
+
+
 def cut_audio(path: Path, start_s: float, end_s: float | None, out: Path) -> Path:
     """Copy the part ``start_s``..``end_s`` (None = to the end) of an audio file without re-encoding."""
     ffmpeg = find_tool("ffmpeg")

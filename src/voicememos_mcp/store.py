@@ -484,21 +484,40 @@ def render_markdown(data: dict, threshold: float, run_min: int = 4, pause_ms: in
         front += [f"> Second reader: {second.get('model')}, word agreement "
                   f"{100 * agreement:.0f} %. `{{a|b}}` shows where the engines differ." if agreement is not None
                   else f"> Second reader: {second.get('model')}.", ""]
+    third = next((r for r in data.get("readers", []) if r.get("role") == "adjudicator" and not r.get("error")), None)
+    if third and third.get("judged"):
+        front += [f"> Third listening ({third.get('model')}) of {third['judged']} of the {third.get('spots')} "
+                  f"spots where the readers differ: `*` marks the reading it sided with (primary "
+                  f"{third.get('primary', 0)}, second reader {third.get('second', 0)}, something else "
+                  f"{third.get('other', 0)}, could not tell {third.get('unclear', 0)}).", ""]
     speakers = data.get("speakers") or {}
     voice = data.get("voiceprint") or {}
     if speakers:
-        parts = ", ".join(f"{v['label']} {100 * v['share']:.0f} %" for v in speakers.values())
+        parts = ", ".join(f"{v['label']} {100 * v['share']:.0f} %" for v in speakers.values()
+                          if not v.get("quarantine"))
         note = (" S-labels hold within one part only: the letter is the part, and S2a and S2b are not "
                 "necessarily the same person." if segments else " S-labels hold within this memo only.")
         if any(v.get("basis") == "voiceprint" for v in speakers.values()):
-            scored = ", ".join(f"{v['label']} {v['voiceprint']:.2f}" for v in speakers.values()
-                               if v.get("voiceprint") is not None)
+            scored = ", ".join(f"{v['label']} {v['voice'] if v.get('voice') is not None else v['voiceprint']:.2f}"
+                               for v in speakers.values()
+                               if v.get("voiceprint") is not None and not v.get("quarantine"))
             note += f" The name comes from a voiceprint match (similarity: {scored}); (?) = possible match."
         front += [f"> Speakers (share of words): {parts}.{note}", ""]
+        split = data.get("speaker_split") or {}
+        if split.get("changed_words"):
+            front += [f"> The speakers are divided by voice on this machine, not as the speech engine numbered "
+                      f"them: {split.get('engine_speakers')} engine speakers, {split.get('speakers')} voices, "
+                      f"{split['changed_words']} words moved.", ""]
+        aside = data.get("quarantine") or {}
+        if aside.get("words"):
+            front += [f"> {aside['words']} words of {aside['speakers']} unknown voice(s) that said under "
+                      f"{aside['max_s']:g} s in all are left out of this text; they are in the JSON file.", ""]
     elif voice.get("score") is not None:
         verdict = {"match": f"matches {voice['name']}", "possible": f"possibly {voice['name']} (?)",
                    "no match": f"does not match {voice['name']}"}.get(voice.get("result"), voice.get("result"))
         front += [f"> Voiceprint: {verdict} (similarity {voice['score']:.2f}).", ""]
+        if (voice.get("named") or {}).get("name"):
+            front += [f"> Voice: sounds like {voice['named']['name']} (similarity {voice['named']['score']:.2f}).", ""]
     if not data.get("confidence_available"):
         front += ["> Warning: the engine returned no confidence values, so nothing is marked as uncertain.", ""]
     if markers:

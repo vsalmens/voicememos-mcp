@@ -11,7 +11,8 @@ def test_server_exposes_tools(cfg):
     names = {t.name for t in asyncio.run(server.list_tools())}
     assert names == {"voicememos_status", "voicememos_list", "voicememos_read", "voicememos_search",
                      "voicememos_markers", "voicememos_transcribe", "voicememos_transcribe_status",
-                     "voicememos_second_read", "voicememos_compare_readers", "voicememos_voiceprint"}
+                     "voicememos_second_read", "voicememos_compare_readers", "voicememos_voiceprint",
+                     "voicememos_annotate"}
 
 
 def test_config_file_and_environment(tmp_path):

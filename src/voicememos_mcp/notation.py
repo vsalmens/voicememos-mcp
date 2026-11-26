@@ -15,6 +15,7 @@ Two layers are kept apart:
   ``[?: w1 w2 w3]``    run of consecutive low-confidence words (best guesses kept)
   ``{a|b}``            two engines disagree: primary engine first, second reader after
   ``{a b|∅}``          the second reader heard nothing here (``{∅|b}``: only it heard something)
+  ``{a*|b}``           a third listening of that spot sided with the starred reading
   ``[?]``              something was said but nothing usable was recognised
   ===================  ==========================================================
 
@@ -43,10 +44,19 @@ READER_NOTE = (
     "Use marked words, but do not present them as certain. If context suggests a different word, propose "
     "it visibly as `word→suggestion (?)` instead of replacing it silently. `[?: word ×N]` means the "
     "engine produced the same word N times in a row, usually a mishearing over music or noise. "
-    "`[mm:ss]` / `[h:mm:ss]` at the start of a paragraph is its time in the recording."
+    "`[mm:ss]` / `[h:mm:ss]` at the start of a paragraph is its time in the recording. A `*` inside "
+    "braces (`{a*|b}`) marks the reading a third listening of that spot sided with: more likely, not certain."
 )
 
 REPEAT_MIN = 4  # this many identical words in a row are treated as a recognition loop
+
+
+def shown(words: list[dict]) -> list[dict]:
+    """The words a transcript shows: all but those set aside (``quarantine``: a few seconds of
+    a voice nobody could be put to, kept in the data and left out of the text)."""
+    if not any(w.get("quarantine") for w in words):
+        return words
+    return [w for w in words if not w.get("quarantine")]
 
 
 def _norm_word(text: str) -> str:
@@ -169,9 +179,19 @@ def _is_uncertain(word: dict, threshold: float) -> bool:
     return conf is not None and conf < threshold and not _has_alternative(word)
 
 
-def _choice(options: list[str], tail: str = "") -> str:
-    cleaned = list(dict.fromkeys(_split_trailing(o)[0] if o else EMPTY for o in options))
-    return "{" + "|".join(o or EMPTY for o in cleaned) + "}" + tail
+def _choice(options: list[str], tail: str = "", adj: dict | None = None) -> str:
+    """``{a|b}``. With ``adj`` (a third listening, see ``adjudicate.py``) the reading it sided
+    with gets a ``*``; a third thing it heard instead is added as ``|c*``."""
+    keys = [(_split_trailing(o)[0] if o else "") or EMPTY for o in options]
+    cleaned = list(dict.fromkeys(keys))
+    pick = (adj or {}).get("pick")
+    if isinstance(pick, int) and not isinstance(pick, bool) and 0 <= pick < len(keys) and len(cleaned) > 1:
+        cleaned = [o + "*" if o == keys[pick] else o for o in cleaned]
+    elif pick == "other" and (adj or {}).get("heard"):
+        heard = _split_trailing(str(adj["heard"]))[0]
+        if heard and heard not in cleaned:
+            cleaned.append(heard + "*")
+    return "{" + "|".join(cleaned) + "}" + tail
 
 
 def render_word(word: dict, threshold: float) -> str:
@@ -180,7 +200,7 @@ def render_word(word: dict, threshold: float) -> str:
         return "[?]"
     if word.get("alts"):
         body, tail = _split_trailing(text)
-        return _choice([body] + list(word["alts"]), tail)
+        return _choice([body] + list(word["alts"]), tail, word.get("adj"))
     if _is_uncertain(word, threshold):
         body, tail = _split_trailing(text)
         return f"{body} (?){tail}" if body else tail
@@ -188,8 +208,8 @@ def render_word(word: dict, threshold: float) -> str:
 
 
 def _with_inserts(word: dict, rendered: str) -> str:
-    before = " ".join(_choice([""] + [alt]) for alt in word.get("insert_before", []))
-    after = " ".join(_choice([""] + [alt]) for alt in word.get("insert_after", []))
+    before = " ".join(_choice([""] + [alt], adj=word.get("adj_before")) for alt in word.get("insert_before", []))
+    after = " ".join(_choice([""] + [alt], adj=word.get("adj_after")) for alt in word.get("insert_after", []))
     return " ".join(x for x in (before, rendered, after) if x)
 
 
@@ -256,6 +276,7 @@ def layout(words: list[dict], threshold: float, run_min: int = 4, pause_ms: int 
     stamp as it was where the range ended, and ``block_start`` false says the first paragraph after
     the range is the rest of a paragraph that began inside it (it gets no stamp of its own)."""
     speakers = speakers or {}
+    words = shown(words)
     blocks: list[list[str]] = [[]]
     prefixes: list[str] = [""]
     starts: list[int | None] = [None]
@@ -317,10 +338,12 @@ def layout(words: list[dict], threshold: float, run_min: int = 4, pause_ms: int 
             span = word["span"]
             group = words[i: i + max(span.get("n", 1), 1)]
             body, tail = _split_trailing(" ".join(w["text"] for w in group)) if span.get("n", 1) else ("", "")
-            rendered = _choice([body] + list(span.get("alts", [])), tail)
+            rendered = _choice([body] + list(span.get("alts", [])), tail, word.get("adj"))
             last = group[-1] if group else word
             blocks[-1].append(_with_inserts({"insert_before": word.get("insert_before", []),
-                                             "insert_after": last.get("insert_after", [])}, rendered))
+                                             "insert_after": last.get("insert_after", []),
+                                             "adj_before": word.get("adj_before"),
+                                             "adj_after": last.get("adj_after")}, rendered))
             i += max(len(group), 1)
             continue
         if _is_uncertain(word, threshold) and not word.get("insert_after") and not word.get("insert_before"):
@@ -373,6 +396,7 @@ def layout(words: list[dict], threshold: float, run_min: int = 4, pause_ms: int 
 
 def stats(words: list[dict], threshold: float) -> dict:
     """Counts and an overall certainty level (share of marked words)."""
+    words = shown(words)
     total = len(words)
     repeated = {k for a, b in repetition_runs(words).items() for k in range(a, b)}
     uncertain = sum(1 for k, w in enumerate(words) if _is_uncertain(w, threshold) or k in repeated)
@@ -449,6 +473,7 @@ def _shaky(word: dict, threshold: float) -> bool:
 
 
 def _markers_from_words(words: list[dict], spec: MarkerSpec, threshold: float) -> list[dict]:
+    words = shown(words)
     triggers = []  # (wake index, kind pattern or None for an end phrase, index of the kind/end word)
     for i, w in enumerate(words[:-1]):
         if not _match(w.get("text", ""), spec.wake):

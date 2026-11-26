@@ -114,8 +114,9 @@ class Gemini:
         except Exception as exc:  # noqa: BLE001 - cleanup must not mask the real error
             log.warning("Gemini cleanup failed for %s: %s", name, exc)
 
-    def transcribe(self, audio: Path, prompt: str) -> dict:
-        """Return ``{"text": ..., "usage": {...}, "model": ...}``."""
+    def transcribe(self, audio: Path, prompt: str, json_mode: bool = False) -> dict:
+        """Return ``{"text": ..., "usage": {...}, "model": ...}``. With ``json_mode`` the model is
+        asked to answer in JSON (the third listening, ``adjudicate.py``)."""
         mime = mimetypes.guess_type(audio.name)[0] or "audio/mp4"
         if audio.suffix.lower() == ".m4a":
             mime = "audio/mp4"
@@ -127,7 +128,8 @@ class Gemini:
                 uploaded = self._upload(audio, mime)
                 part = {"file_data": {"mime_type": uploaded.get("mimeType", mime), "file_uri": uploaded["uri"]}}
             body = {"contents": [{"role": "user", "parts": [part, {"text": prompt}]}],
-                    "generationConfig": {"temperature": 0}}
+                    "generationConfig": {"temperature": 0, **({"responseMimeType": "application/json"}
+                                                              if json_mode else {})}}
             response = self._post(f"{API}/v1beta/models/{self.model}:generateContent", json=body,
                                   timeout=self.timeout).json()
         finally:

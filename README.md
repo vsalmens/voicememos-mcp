@@ -83,6 +83,7 @@ change). `voicememos_status` and `voicememos-mcp check` show the last months.
 | `[?: w1 w2 w3 w4]` | several consecutive uncertain words (guesses kept) |
 | `{a\|b}` | two engines heard different things: primary engine first, second reader after |
 | `{a b\|∅}`, `{∅\|b}` | only one of the engines heard something here |
+| `{a*\|b}`, `{a\|b\|c*}` | a third listening of that spot sided with the starred reading, or heard a third thing ([Third listening](#third-listening)) |
 | `[?]` | something was said, nothing usable was recognised |
 | `[?: word ×N]` | the engine produced the same word N times in a row (4+), usually a loop over music or noise; JSON flag `repetition` |
 | `[12:34]` / `[1:02:03]` | time in the recording at the start of a paragraph, at most once a minute (`VOICEMEMOS_TIMESTAMP_EVERY_S`) |
@@ -158,9 +159,91 @@ Known other voices are never shown as labels; they only stop a speaker from bein
 you when that speaker is as close, or nearly as close, to a known other voice. Run
 `action="identify"` again afterwards; `action="remove_other", name="<name>"` removes one.
 
-The voiceprint is biometric data. It is stored only in `DATA_DIR/voiceprint.json` (file mode
-600), never in transcripts, and the MCP tools report only a summary. Delete that file to
+**Named voices.** Other people can be stored the same way and shown by name:
+`voicememos_voiceprint(action="add_voice", memos=["<id>"], speaker="S2", name="<name>")`. In
+transcripts made or identified afterwards, a speaker who matches gets the name instead of `S2`.
+One recording gives a voice in one room through one microphone, and two people in the same
+room come out more alike than one person in two rooms. So a name is given only when it stands
+out: the score reaches your own match threshold and is at least 0.10 above what every other
+speaker of the recording scores against that name; a speaker who reaches the threshold without
+standing out gets `Name (?)`. Adding the same person from several recordings (same `name`)
+makes the stored voice an average over rooms. `action="remove_voice", name="<name>"` removes
+one. A synthetic voice that a phone reads answers aloud with is in no memo alone, so it is
+stored from a file that holds only that voice:
+`voicememos-mcp voiceprint add_other --file sample.m4a --name "<name>"` (`add_voice` to see it
+named in transcripts). The file is read where it is; nothing is transcribed or sent.
+
+**Unknown voices of a few seconds.** With `VOICEMEMOS_QUARANTINE_S="5"`, a voice nobody could
+be put to that says less than five seconds in all, in a recording where you were recognised (a
+passer-by, a television), is left out of the rendered text. Its words stay in the JSON file
+with `quarantine: true`, the transcript says how many were left out, and `voicememos_status`
+counts them. The rule is the speaker's whole talk and not one stretch, so the short answers of
+someone you are talking with are never set aside.
+
+The voiceprint is biometric data, and so is every stored voice of another person: store one
+only of somebody who knows. It is stored only in `DATA_DIR/voiceprint.json` (file mode
+600), never in transcripts, and the MCP tools report only names and a summary. Delete that file to
 remove it.
+
+## Own speaker split (optional)
+
+The speech engine's speakers are often not people. Seen with Soniox v5 and v6 on meetings and
+on a recorder's ambient recordings: two people under one number, one person under two numbers,
+a minute of one person's talk under another's number. `VOICEMEMOS_SPEAKER_SPLIT="1"` (new
+memos) or `voicememos-mcp annotate speakers --memo <id>` (an existing transcript) looks at the
+engine's speakers again with the voiceprint's model, on this machine:
+
+1. each speaker's talk is cut into units of a few seconds and embedded,
+2. a speaker whose units fall into two groups with clearly different average voices is divided,
+3. groups with the same average voice are joined, whichever engine speaker they came from.
+
+On ten recordings (three Zoom meetings, seven ambient recordings, 18 to 137 minutes) the
+average voices of two groups with at least 40 s of talk each were mostly either at least 0.84
+alike (one person) or at most 0.67 (two people); the line is drawn at 0.72. A few pairs fell
+between 0.67 and 0.80, and those decisions can be wrong either way. Smaller groups are divided
+off only below 0.55 and joined only from 0.80 on; what falls between stays where the engine
+put it. In those ten recordings the split moved between 0 % and 57 % of the words to another
+speaker. One check that did not depend on the split's own model output: where the owner's
+voiceprint matched, the other speakers scored lower against it after the split than before.
+**It has not been checked against a recording labelled by ear**, which is why it is off by
+default.
+
+What it does not do: a recording in which the engine found one speaker is never divided (a
+dictation must not become two people because the room changed); a person with a few seconds of
+talk is not found; one person recorded in two very different conditions can come out as two.
+The engine's own number stays in the data (`speaker_engine` on every word that moved), and
+`speaker_split` in the JSON says what was divided and joined. The transcript's header says
+when the speakers are the split's and not the engine's.
+
+## How it was said (optional)
+
+`VOICEMEMOS_PROSODY="1"` (new memos) or `voicememos-mcp annotate prosody --memo <id>` measures
+every word from the audio, on this machine, against the same speaker's own level in that
+recording: loudness (`db`), pitch (`st`, semitones) and tempo (`rate`, 1.0 = the speaker's
+usual). The values are kept per word in the JSON (`pros`), the speakers' levels in `prosody`.
+They are measurements, not a reading of feeling: nothing here says "angry" or "glad". An
+hour of audio takes about ten seconds.
+
+The Markdown transcript does not change. `voicememos_read(format="ca")` (or
+`voicememos-mcp export <id> --format ca`) renders a light conversation-analysis view from the
+data:
+
+| Mark | Meaning |
+|---|---|
+| `(0.8)`, `(.)` | a pause in seconds; a short one (0.25 to 0.5 s) |
+| `=` | the next turn starts with no gap |
+| `↑word`, `↓word` | the pitch jumps at least 7 semitones against the words just before |
+| `WORD`, `°word°` | at least 10 dB louder, or 15 dB quieter, than the speaker's usual, for two words or more |
+| `>words<`, `<words>` | faster (1.6 times) or slower (0.6) than the speaker's usual, for three words or more |
+| `wo:rd` | a stretched sound |
+
+With these limits each mark falls on about one to three words in a hundred (measured on two
+meetings, an ambient recording and a dictation); the limits are in `ca.Limits`. Pauses and
+gaps come from the word times and are shown also for a recording that has not been measured.
+Not available from Soniox, so not in the view: overlapping talk and events such as laughter;
+and Soniox tidies fillers and colloquial forms, so the view is not a verbatim transcript.
+Pitch is rough on speech through a codec: a word about an octave from the speaker's level is
+folded back, as nearly all such values are tracking errors or creaky voice.
 
 ## Recordings from elsewhere
 
@@ -322,6 +405,41 @@ with the current rules. No audio is sent and no API is called.
 Transcripts start with a short reading guide that asks language models not to present
 marked words as certain, and to propose corrections visibly (`word→suggestion (?)`).
 
+## Third listening
+
+Where the two readers differ, nobody knows who is right. `voicememos-mcp annotate adjudicate
+--memo <id>` (or `VOICEMEMOS_ADJUDICATE="1"`, after every second reading) lets a model hear a
+few seconds around each such spot. It is given both readings without being told whose they are
+(their order is shuffled per spot) and answers which one it hears, something else, or that it
+cannot tell. The answer is kept on the word and shown as a `*`: `{a*|b}`, `{a|b|c*}`. Nothing
+is replaced. At most `VOICEMEMOS_ADJUDICATE_MAX` spots per recording (default 60), those where
+the primary engine was least confident first; one request per spot, so sixty spots are sixty
+short clips sent to the Gemini API.
+
+Tried on 26.11.2026 on the 30 most doubtful spots of one 18-minute meeting, with a second
+reading by Gemini 4 Argon:
+
+| Listener | Soniox | second reader | something else | could not tell | time | tokens |
+|---|---|---|---|---|---|---|
+| `gemini-4-argon` | 11 | 13 | 5 | 1 | 168 s | 17 000 |
+| `gemini-4-neon` | 5 | 14 | 5 | 6 | 969 s | 119 000 |
+
+The two gave the same answer on 18 of the 30 spots. Nobody has listened to those spots, so
+this says what each costs and that they disagree, not which is right. Neon thinks before it
+answers (about 4 000 tokens and half a minute per spot), so the default is Argon.
+
+It is a third opinion, not a verdict: a model of the same family as the second reader tends to
+hear what its sibling heard, and a listener who is shown two readings leans towards them. The
+transcript's header says how often each side was picked.
+
+## Other formats
+
+`voicememos_read(format="vtt")` and `voicememos-mcp export <id> --format vtt` give WebVTT
+subtitles (cues of at most seven seconds, the speaker as a voice tag); `format="tei"` gives
+TEI P5 spoken text (`<u>` per turn with a timeline, `<w>`, `<pause>`, `<unclear cert>` for
+words under the threshold, `<choice>` with one `<seg>` per reading where the readers differ).
+Both are made from the JSON on request and stored nowhere.
+
 ## Requirements
 
 * macOS 14 or later with Voice Memos iCloud sync enabled on the iPhone and the Mac
@@ -432,6 +550,12 @@ All settings are in `~/.config/voicememos-mcp/config.env`; see
 | `VOICEMEMOS_SECOND_READER_CHUNK_MIN` | `30` | approximate length of a part |
 | `VOICEMEMOS_SECOND_READER_MAX_TOTAL_MIN` | `600` | longer memos get no automatic second reading |
 | `VOICEMEMOS_SEGMENT_LONG` | `1` | split memos longer than the engine accepts (see [Limitations](#limitations)) |
+| `VOICEMEMOS_SPEAKER_SPLIT` | `0` | divide and join the engine's speakers by voice ([Own speaker split](#own-speaker-split-optional)) |
+| `VOICEMEMOS_PROSODY` | `0` | measure loudness, pitch and tempo per word ([How it was said](#how-it-was-said-optional)) |
+| `VOICEMEMOS_QUARANTINE_S` | `0` | leave an unknown voice with less talk than this out of the text; 0 = off |
+| `VOICEMEMOS_ADJUDICATE` | `0` | a third listening after every second reading ([Third listening](#third-listening)) |
+| `VOICEMEMOS_ADJUDICATOR_MODEL` | `gemini-4-argon` | `--model gemini-4-neon` for one run |
+| `VOICEMEMOS_ADJUDICATE_MAX` | `60` | spots per recording |
 | `VOICEMEMOS_SEGMENT_MARGIN_MIN` | `5` | parts are at most `VOICEMEMOS_MAX_DURATION_MIN` (298) minus this |
 | `VOICEMEMOS_SEGMENT_SILENCE_WINDOW_MIN` | `10` | move each cut to the longest silence this close to the even split |
 | `VOICEMEMOS_ROAM_ENABLED` | `0` | append new transcripts to Roam daily notes |
@@ -445,13 +569,14 @@ titles.
 |---|---|
 | `voicememos_status` | counts by status, worker health, alerts, usage per month, configuration, warnings |
 | `voicememos_list` | memos newest first; filter by date, title, status; paging |
-| `voicememos_read` | one transcript as Markdown, plain text or word-level JSON; optional `threshold` re-renders without re-transcribing; paging for long memos |
+| `voicememos_read` | one transcript as Markdown, plain text, word-level JSON, the conversation-analysis view (`ca`), WebVTT (`vtt`) or TEI (`tei`); optional `threshold` re-renders without re-transcribing; paging for long memos |
 | `voicememos_search` | case-insensitive search (or regex) over transcripts and titles, with snippets |
 | `voicememos_markers` | sentences tagged with a spoken marker ("Idea: ...") across memos |
 | `voicememos_transcribe` | queue memos (by id or date range) for background transcription; returns a job id |
 | `voicememos_second_read` | queue an independent Gemini reading of transcribed memos |
 | `voicememos_compare_readers` | per-language comparison of the readers, with a listening checklist |
-| `voicememos_voiceprint` | voiceprint status and enrollment suggestions, enroll, identify |
+| `voicememos_voiceprint` | voiceprint status and enrollment suggestions, enroll, identify, known and named other voices |
+| `voicememos_annotate` | queue optional passes over transcribed memos: `speakers` (own split), `prosody` (measurements), `adjudicate` (third listening) |
 | `voicememos_transcribe_status` | job progress, or recent jobs |
 
 Memo status values: `transcribed`, `pending` (will be transcribed automatically),
@@ -478,6 +603,9 @@ voicememos-mcp report                        # compare readers per language
 voicememos-mcp voiceprint status             # enrollment state and suggestions
 voicememos-mcp launchd-plist                 # print the launchd job definition
 voicememos-mcp redact plan --memo ID --from-ms 6795000 --to-ms 7137000   # see below
+voicememos-mcp annotate speakers prosody --memo 1a2b3c4d   # own speaker split and measurements for one transcript
+voicememos-mcp annotate adjudicate --since 2026-11-01 --limit 5   # third listening of disputed spots
+voicememos-mcp export 1a2b3c4d --format ca   # conversation-analysis view (also vtt, tei)
 ```
 
 ### Taking a stretch out of a recording
@@ -554,8 +682,9 @@ transcripts without new API calls.
 
 ## Roadmap
 
-* Adjudication: a third pass that listens to the disputed segment and picks a reading.
-* Export to TEI (spoken text) and WebVTT.
+* The own speaker split checked against recordings labelled by ear, and across the parts of a
+  recording transcribed in parts.
+* Overlapping talk and audio events (laughter), which the primary engine does not give.
 
 ## Development
 

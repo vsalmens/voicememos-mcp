@@ -18,13 +18,27 @@ Labels:
 * ``Name (?)``  score >= maybe threshold, or not clearly above another speaker
 * otherwise the anonymous label (S1, S2, ...) is kept
 
-Known other voices ("not me", e.g. a relative whose voice is close to the owner's) can be
-added from one speaker of a memo. They are never shown by name; they only stop a speaker
-from being labelled as the owner when that speaker is as close, or nearly as close, to a
-known other voice.
+Known other voices ("not me", e.g. a relative whose voice is close to the owner's, or the
+synthetic voice a phone reads answers aloud with) can be added from one speaker of a memo.
+They are never shown by name; they only stop a speaker from being labelled as the owner when
+that speaker is as close, or nearly as close, to a known other voice.
 
-The voiceprint is biometric data. It is stored only in DATA_DIR/voiceprint.json (mode 600)
-and never in transcripts; MCP tools only report a summary.
+Named voices are other people stored the same way but shown: a speaker who matches one gets
+the name instead of S2. One recording gives a voice in one room through one microphone, and
+two people in the same room come out more alike than one person in two rooms, so a name is
+given only when it stands out: the score must reach the match threshold and be clearly above
+what every other speaker of the recording scores against that name (``NAMED_MARGIN``), and
+above what the same speaker scores against other names. A speaker who reaches the threshold
+without standing out gets ``Name (?)``. Adding the same person from several recordings makes
+the stored voice an average over rooms, which is what makes it hold.
+
+A voice nobody could be put to that says only a few seconds in a recording where the owner
+was recognised (a passer-by, a television) can be set aside: ``quarantine`` flags its words,
+which stay in the data and are left out of the rendered text.
+
+The voiceprint is biometric data, and so is every stored voice of another person: store one
+only of somebody who knows. It is all kept only in DATA_DIR/voiceprint.json (mode 600) and
+never in transcripts; MCP tools only report names and a summary.
 
 Requires the optional dependencies ``sherpa-onnx`` and ``numpy`` (``pip install
 voicememos-mcp[voiceprint]``) and ffmpeg or macOS ``afconvert`` for decoding.
@@ -58,6 +72,7 @@ CLEAN_TURN_S = 3.0             # known other voices: only turns at least this lo
 TURN_TRIM_S = 0.4              # ... with this much cut from both ends
 MARGIN = 0.05                  # owner must beat the next speaker by this much for a firm label
 MAYBE_GAP = 0.08               # maybe threshold = match threshold - this
+NAMED_MARGIN = 0.10            # a named voice must beat the recording's other speakers by this much
 DEFAULT_BOUNDS = (0.65, 0.95)         # clamp for the match threshold when a model has no own bounds
 
 MAX_MODEL_BYTES = 200 * 1024 * 1024
@@ -292,8 +307,11 @@ def mean_embedding(embed: Embedder, windows: list):
     return _unit(np.mean([_unit(embed(w)) for w in windows], axis=0))
 
 
-def other_voice(name: str, samples, words: list[dict] | None, speaker: str | None, embed: Embedder) -> dict:
-    """Embedding of a known other person ("not me"), from one speaker of one memo.
+def other_voice(name: str, samples, words: list[dict] | None, speaker: str | None, embed: Embedder,
+                show: bool = False) -> dict:
+    """Embedding of a known other person, from one speaker of one memo. With ``show`` the voice
+    is a named one (speakers who match it are labelled with the name); without it the voice is
+    only "not me".
 
     Only longer uninterrupted turns are used, with their edges trimmed, so that words the
     diarization gave to the wrong speaker (short replies, turn changes) do not leak the
@@ -308,15 +326,77 @@ def other_voice(name: str, samples, words: list[dict] | None, speaker: str | Non
     if len(windows) < 3:
         raise VoiceprintError("too little speech from that speaker")
     vector = mean_embedding(embed, windows)
-    return {"name": name, "vector": [round(float(x), 6) for x in vector], "windows": len(windows)}
+    return {"name": name, "vector": [round(float(x), 6) for x in vector], "windows": len(windows),
+            **({"show": True} if show else {})}
 
 
-def _other_centroids(voiceprint: dict) -> dict:
+def _other_centroids(voiceprint: dict, shown: bool | None = None) -> dict:
+    """Stored voices by name, each the average of what was added under that name. ``shown``
+    True: only the named ones, False: only the "not me" ones, None: all."""
     np = _np()
     groups: dict[str, list] = {}
     for other in voiceprint.get("others", []):
-        groups.setdefault(other["name"], []).append(np.array(other["vector"], dtype=np.float32))
+        if shown is None or bool(other.get("show")) == shown:
+            groups.setdefault(other["name"], []).append(np.array(other["vector"], dtype=np.float32))
     return {name: _unit(np.mean(vectors, axis=0)) for name, vectors in groups.items()}
+
+
+def name_speakers(vectors: dict, updated: dict, named: dict, thresholds: dict, owner: str | None = None) -> dict:
+    """Give the speakers who match a named voice its name (in ``updated``). ``vectors`` is
+    speaker -> average voice; ``owner`` is the speaker already labelled as the owner. Returns
+    ``{speaker: {"name", "score", "firm"}}`` for the speakers named."""
+    scores = {name: {spk: float(vector @ centre) for spk, vector in vectors.items() if spk != owner}
+              for name, centre in named.items()}
+    found: dict[str, dict] = {}
+    used: set[str] = set()
+    ranked = sorted(((score, name, spk) for name, per in scores.items() for spk, score in per.items()), reverse=True)
+    for score, name, spk in ranked:
+        if score < thresholds["match"]:
+            break
+        if spk in found or name in used:
+            continue
+        rivals = [s for k, s in scores[name].items() if k != spk]              # other speakers, this name
+        rivals += [per[spk] for other, per in scores.items() if other != name and spk in per]  # this speaker, other names
+        firm = score - max(rivals, default=-1.0) >= NAMED_MARGIN
+        found[spk] = {"name": name, "score": round(score, 4), "firm": firm}
+        used.add(name)
+        updated[spk].update(label=name if firm else f"{name} (?)", basis="voiceprint", voice=round(score, 4))
+    return found
+
+
+def quarantine(words: list[dict], speakers: dict, max_s: float) -> tuple[list[dict], dict | None]:
+    """Set aside what an unknown voice says when it says less than ``max_s`` seconds in all, in
+    a recording where the owner was recognised. The words get ``quarantine`` and stay in the
+    data; the speakers get it too. Returns (words, summary or None when nothing was set aside).
+    The rule is the speaker's whole talk and not a single stretch, so that the short answers of
+    someone the owner is talking with are never taken for noise."""
+    words = [{k: v for k, v in w.items() if k != "quarantine"} for w in words]
+    for value in speakers.values():
+        value.pop("quarantine", None)
+    if max_s <= 0 or not any(v.get("basis") == "voiceprint" for v in speakers.values()):
+        return words, None
+    if any(":" in str(key) for key in speakers):
+        # A memo transcribed in parts: a speaker's number holds within one part only, so somebody
+        # with a few seconds in one part may have talked for minutes in the next. Left as it is.
+        return words, None
+    talk: dict[str, float] = {}
+    for word in words:
+        spk, start, end = word.get("speaker"), word.get("start_ms"), word.get("end_ms")
+        if spk not in (None, "") and start is not None and end is not None:
+            talk[str(spk)] = talk.get(str(spk), 0.0) + max(end - start, 0) / 1000
+    aside = {spk for spk, value in speakers.items()
+             if value.get("basis") != "voiceprint" and talk.get(spk, 0.0) < max_s}
+    if not aside:
+        return words, None
+    count = 0
+    for word in words:
+        if str(word.get("speaker")) in aside:
+            word["quarantine"] = True
+            count += 1
+    for spk in aside:
+        speakers[spk]["quarantine"] = True
+    return words, {"max_s": max_s, "speakers": len(aside), "words": count,
+                   "seconds": round(sum(talk.get(spk, 0.0) for spk in aside), 1)}
 
 
 def _closest_other(vector, others: dict) -> tuple[str | None, float | None]:
@@ -357,7 +437,8 @@ class Voiceprint:
                 "created": data.get("created"), "memos": [e["memo_id"] for e in data.get("enrolled", [])],
                 "own_scores": data.get("own_scores"), "thresholds": data.get("thresholds"),
                 "warnings": data.get("warnings", []),
-                "other_voices": sorted({o["name"] for o in data.get("others", [])})}
+                "other_voices": sorted({o["name"] for o in data.get("others", []) if not o.get("show")}),
+                "named_voices": sorted({o["name"] for o in data.get("others", []) if o.get("show")})}
 
 
 # ----------------------------------------------------------------------------- enroll / identify
@@ -426,6 +507,7 @@ def identify(samples, words: list[dict], speakers: dict, voiceprint: dict, embed
     thresholds = voiceprint["thresholds"]
     name = voiceprint["name"]
     others = _other_centroids(voiceprint)
+    named = _other_centroids(voiceprint, shown=True)
 
     if not speakers:  # one speaker (or no diarization): score the whole memo
         windows = windows_from_spans(samples, speech_spans(words), MAX_WINDOWS_PER_SPEAKER)
@@ -445,13 +527,20 @@ def identify(samples, words: list[dict], speakers: dict, voiceprint: dict, embed
                 summary["result"] = "no match"
             elif result == "match" and score - other_score < thresholds.get("margin", MARGIN):
                 summary["result"] = "possible"
+            # One speaker and no others to stand out against: a named voice is said only when it
+            # is clearly closer than the owner's and than every other stored voice.
+            rest = [float(vector @ c) for n, c in others.items() if n != other]
+            if other in named and summary["result"] == "no match" and other_score >= thresholds["match"] \
+                    and other_score - max([score] + rest) >= NAMED_MARGIN:
+                summary["named"] = {"name": other, "score": other_score}
         return speakers, summary
 
-    scores, closest = {}, {}
+    scores, closest, vectors = {}, {}, {}
     for spk in speakers:
         vector = mean_embedding(embed, windows_from_spans(samples, speech_spans(words, spk),
                                                           MAX_WINDOWS_PER_SPEAKER))
         if vector is not None:
+            vectors[spk] = vector
             scores[spk] = round(float(vector @ centroid), 4)
             other, other_score = _closest_other(vector, others)
             if other is not None:
@@ -468,16 +557,22 @@ def identify(samples, words: list[dict], speakers: dict, voiceprint: dict, embed
     best = max(scores, key=scores.get)
     rest = [s for k, s in scores.items() if k != best]
     margin = scores[best] - max(rest) if rest else 1.0
-    if best in closest:  # a known other voice must also be clearly further away than the owner's
-        if closest[best]["score"] >= scores[best]:
-            return updated, summary
+    owner = None
+    known = best in closest and closest[best]["score"] >= scores[best]  # closer to a stored voice than to the owner's
+    if best in closest and not known:  # a known other voice must also be clearly further away than the owner's
         margin = min(margin, scores[best] - closest[best]["score"])
-    if scores[best] >= thresholds["match"] and margin >= thresholds.get("margin", MARGIN):
+    if not known and scores[best] >= thresholds["match"] and margin >= thresholds.get("margin", MARGIN):
         updated[best].update(label=name, basis="voiceprint")
         summary.update(result="match", speaker=best)
-    elif scores[best] >= thresholds["maybe"]:
+        owner = best
+    elif not known and scores[best] >= thresholds["maybe"]:
         updated[best].update(label=f"{name} (?)", basis="voiceprint")
         summary.update(result="possible", speaker=best)
+        owner = best
+    if named:
+        found = name_speakers(vectors, updated, named, thresholds, owner)
+        if found:
+            summary["named"] = found
     return updated, summary
 
 

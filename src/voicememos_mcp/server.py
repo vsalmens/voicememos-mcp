@@ -75,7 +75,10 @@ def build_server(tools: Tools | None = None):
 
         Args:
             memo: memo id from voicememos_list (8 characters is enough).
-            format: 'markdown' (with header), 'text' (transcript only) or 'json' (word-level data).
+            format: 'markdown' (with header), 'text' (transcript only), 'json' (word-level data),
+                'ca' (a light conversation-analysis view: pauses, gaps between turns and, when the
+                recording has been measured, pitch jumps, loudness, tempo and stretched sounds),
+                'vtt' (WebVTT subtitles) or 'tei' (TEI XML, spoken text).
             threshold: confidence threshold for marking words (default from config); re-renders
                 without re-transcribing.
             offset: character offset for long transcripts (see next_offset).
@@ -173,16 +176,42 @@ def build_server(tools: Tools | None = None):
                 'identify' (apply it to already transcribed memos),
                 'add_other' (store a known other voice, e.g. a relative who sounds similar, from
                 one speaker of one memo; it is never shown by name, it only prevents mistaking
-                that person for the owner) or 'remove_other' (by name).
+                that person for the owner), 'add_voice' (the same, but named: speakers who match
+                it are labelled with the name in transcripts made or identified afterwards; add
+                the same person from several recordings for a steadier match, and only store the
+                voice of somebody who knows) or 'remove_other' / 'remove_voice' (by name).
             memos: memo ids for 'enroll' (2+, ideally 4-6 from different years), 'identify', or
-                one memo for 'add_other'.
+                one memo for 'add_other' / 'add_voice'.
             since: for 'identify': memos recorded on or after this date (YYYY-MM-DD).
             until: for 'identify': memos recorded on or before this date (YYYY-MM-DD).
             name: the owner's name for 'enroll' (default from config); the other person's name
-                for 'add_other' / 'remove_other'.
-            speaker: for 'add_other' in a multi-speaker memo: the speaker label (S1, S2, ...).
+                for 'add_other' / 'add_voice' / 'remove_other' / 'remove_voice'.
+            speaker: for 'add_other' / 'add_voice' in a multi-speaker memo: the speaker label as
+                the transcript shows it (S1, S2, ...).
         """
         return call(tools.voiceprint, action, memos, since, until, name, speaker)
+
+    @server.tool()
+    def voicememos_annotate(what: list[str], memos: Optional[list[str]] = None, since: Optional[str] = None,
+                            until: Optional[str] = None, redo: bool = False, limit: Optional[int] = None,
+                            model: Optional[str] = None) -> dict:
+        """Queue optional passes over already transcribed memos. Returns a job_id.
+
+        Args:
+            what: one or more of 'speakers' (divide and join the speech engine's speakers by
+                voice on this machine, then apply the voiceprint and names again; the engine's own
+                numbers stay in the data), 'prosody' (measure loudness, pitch and tempo per word
+                against each speaker's own level; read them with voicememos_read format 'ca') and
+                'adjudicate' (a third listening by another model of the spots where the two readers
+                differ; needs a second reading; marks the reading it sided with as {a*|b}).
+            memos: memo ids.
+            since: or: memos recorded on or after this date (YYYY-MM-DD).
+            until: or: memos recorded on or before this date (YYYY-MM-DD).
+            redo: do a pass again even if the memo has been through it.
+            limit: at most this many memos (oldest first).
+            model: for 'adjudicate': the model id (default from config).
+        """
+        return call(tools.annotate, what, memos, since, until, redo, limit, model)
 
     @server.tool()
     def voicememos_transcribe_status(job_id: Optional[str] = None) -> dict:
