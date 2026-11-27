@@ -63,9 +63,9 @@ def test_ca_view_marks_pauses_latching_and_what_was_measured():
         word("se", 4600, 4700, speaker="2", pros={"rate": 2.0}), word("on", 4700, 4800, speaker="2", pros={"rate": 2.1}),
         word("ihan", 4800, 4900, speaker="2", pros={"rate": 1.9}), word("ok.", 4900, 5200, speaker="2", pros={"rate": 1.0}),
     ]
-    speakers = {"1": {"label": "Ville"}, "2": {"label": "S2"}}
+    speakers = {"1": {"label": "Alex"}, "2": {"label": "S2"}}
     lines = ca.render(words, 0.7, speakers)
-    assert lines == ["[00:00] Ville: no niin (0.8) mä ajattelin että ↑EI KÄY=",
+    assert lines == ["[00:00] Alex: no niin (0.8) mä ajattelin että ↑EI KÄY=",
                      "[00:03] S2: = joo:: (.) >se on ihan< ok."]
     counts = ca.mark_counts(words)
     assert counts["loud"] == 2 and counts["up"] == 1 and counts["fast"] == 3 and counts["stretch"] == 1
