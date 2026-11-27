@@ -79,7 +79,7 @@ def cmd_second_read(args) -> int:
     from .worker import Worker
 
     cfg = load_config()
-    if args.queue:
+    if args.queue and not args.candidate:
         from .tools import Tools
 
         since = args.since or ("1970-01-01" if not args.memo else None)
@@ -87,9 +87,15 @@ def cmd_second_read(args) -> int:
                                                 args.only_uncertain, args.realign),
                          indent=1))
         return 0
+    if args.candidate and not args.model:
+        print("--candidate needs --model (e.g. gemini-4-neon or gemini-3.5-transcribe)", file=sys.stderr)
+        return 2
+    if args.candidate and args.queue:
+        print("--candidate runs directly, without --queue", file=sys.stderr)
+        return 2
     summary = Worker(cfg).run_second_read(only=args.memo, since=args.since, until=args.until, limit=args.limit,
                                           model=args.model, redo=args.redo, only_uncertain=args.only_uncertain,
-                                          realign=args.realign)
+                                          realign=args.realign, candidate=args.candidate)
     for item in summary.get("items", []):
         agreement = item.get("agreement")
         agreement = agreement.get("agreement") if isinstance(agreement, dict) else agreement
@@ -260,6 +266,40 @@ def cmd_report(args) -> int:
     store = Store(cfg.data_dir, cfg.output_dir, cfg.folder_dirs)
     paths = write_report(store, build_report(store, args.since, args.until, args.samples))
     print(paths["markdown"])
+    return 0
+
+
+def cmd_score_readers(args) -> int:
+    """Score every reading of the labelled memos against marked listening checklists."""
+    from pathlib import Path
+
+    from .score import parse_labels, render, score
+    from .tools import Tools, ToolError
+
+    cfg = load_config()
+    tools = Tools(cfg)
+    spots = []
+    for path in args.labels:
+        spots += parse_labels(Path(path).expanduser().read_text(encoding="utf-8"))
+    if not spots:
+        print("no marked spots found (better: A / B / both)", file=sys.stderr)
+        return 1
+    transcripts = {}
+    for memo in sorted({s.memo for s in spots}):
+        try:
+            entry = tools._find(memo)
+            data = tools._load_transcript(entry["transcript"]["json"]) if entry.get("transcript") else None
+        except ToolError as exc:
+            print(f"{memo}: {exc}", file=sys.stderr)
+            continue
+        if data is not None:
+            transcripts[memo] = data
+    text = f"# Reader score\n\n{len(spots)} marked spots in {len(transcripts)} memos.\n\n" + render(score(spots, transcripts))
+    print(text)
+    if args.out:
+        out = Path(args.out).expanduser()
+        out.write_text(text + "\n", encoding="utf-8")
+        print(f"\nwritten to {out}", file=sys.stderr)
     return 0
 
 
@@ -496,6 +536,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--redo", action="store_true", help="read again even if already read")
     p.add_argument("--realign", action="store_true",
                    help="align the stored readings again with the current rules (no API calls)")
+    p.add_argument("--candidate", action="store_true",
+                   help="read with --model for comparison only: stored beside the active reading, "
+                        "the transcript does not change (see score-readers)")
     p.add_argument("--only-uncertain", action="store_true",
                    help="only memos (or parts of long recordings) with low certainty")
     p.add_argument("--queue", action="store_true",
@@ -533,6 +576,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--since")
     p.add_argument("--until")
     p.add_argument("--samples", type=int, default=15, help="disagreements to sample per language")
+
+    p = sub.add_parser("score-readers", help="score all readings (primary, active, candidates) against "
+                                             "marked listening checklists (better: A / B / both)")
+    p.add_argument("labels", nargs="+", help="marked _reports/second-reader_*.md files")
+    p.add_argument("--out", help="also write the result to this file")
 
     p = sub.add_parser("import", help="copy recordings made elsewhere (Zoom, a recorder) into the import "
                                       "folder; the worker transcribes them like memos")
@@ -578,6 +626,7 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {None: cmd_serve, "serve": cmd_serve, "sync": cmd_sync, "check": cmd_check,
                 "transcribe-file": cmd_transcribe_file, "launchd-plist": cmd_launchd_plist,
                 "second-read": cmd_second_read, "report": cmd_report, "voiceprint": cmd_voiceprint,
+                "score-readers": cmd_score_readers,
                 "import": cmd_import, "plaud": cmd_plaud, "redact": cmd_redact, "annotate": cmd_annotate,
                 "export": cmd_export}
     return handlers[args.command](args)

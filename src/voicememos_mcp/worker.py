@@ -153,12 +153,16 @@ def soniox_transcriber(cfg: Config, pending_path: Path | None = None) -> Transcr
 
 
 def gemini_reader(cfg: Config, model: str | None = None) -> SecondReader:
-    from .gemini import Gemini, build_prompt
+    from .gemini import Gemini, GeminiTranscribe, build_prompt, is_transcribe_model
 
     key = cfg.secret("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("GEMINI_API_KEY is not set (environment or Keychain)")
-    client = Gemini(key, model or cfg.get("VOICEMEMOS_SECOND_READER_MODEL"))
+    model = model or cfg.get("VOICEMEMOS_SECOND_READER_MODEL")
+    if is_transcribe_model(model):
+        client = GeminiTranscribe(key, model, languages=cfg.languages, vocabulary=cfg.context_terms)
+    else:
+        client = Gemini(key, model)
     prompt = build_prompt(cfg.languages, cfg.context_terms, cfg.context_text)
 
     def read(audio: Path) -> dict:
@@ -210,6 +214,7 @@ class Worker:
         self.store.stamp_every_s = cfg.timestamp_every_s
         self._transcriber = transcriber
         self._second_reader = second_reader
+        self.reader_factory = gemini_reader  # model id -> reader; tests replace it
         self._embedder = embedder
         self._audio_loader = audio_loader
         self._cut_audio = audio_cutter
@@ -1379,6 +1384,43 @@ class Worker:
         self.state[memo.id] = entry
         return {**item, "status": "annotated", "done": done, "markdown": result["markdown"]}
 
+    def candidate_read_memo(self, memo: Memo, model: str, redo: bool = False) -> dict:
+        """Read a memo with another model for comparison only.
+
+        The reading is stored in the transcript JSON as a reader with role ``candidate``
+        (one per model); the transcript itself, its marks and the active second reader do
+        not change. ``voicememos-mcp score-readers`` compares the readers with listening labels."""
+        item = {"id": memo.id, "short_id": memo.short_id, "title": memo.title, "recorded": memo.recorded}
+        entry = self.state.get(memo.id, {})
+        if not entry.get("ok"):
+            return {**item, "status": "not_transcribed", "error": "transcribe it first"}
+        data = self.store.load_transcript(entry["json"])
+        if data is None:
+            return {**item, "status": "failed", "error": "transcript file missing"}
+        readers = data.get("readers", [])
+        if not redo and any(r.get("role") == "candidate" and r.get("requested_model") == model and not r.get("error")
+                            for r in readers):
+            return {**item, "status": "already_read"}
+        if not memo.local or not memo.filename:
+            return {**item, "status": "not_downloaded"}
+        try:
+            reader = self.reader_factory(self.cfg, model)
+            with tempfile.TemporaryDirectory(prefix="voicememos-") as tmp:
+                audio = prepare_audio(self._audio_path(memo), Path(tmp))
+                _, record = self._apply_second_reader(reader, audio, memo, data.get("words", []))
+        except Exception as exc:  # noqa: BLE001
+            return {**item, "status": "failed", "error": str(exc)[:300]}
+        record.update(role="candidate", requested_model=model)
+        if record.get("error") and not str(record["error"]).startswith("rejected"):
+            return {**item, "status": "failed", "error": record["error"]}
+        data["readers"] = [r for r in readers if not (r.get("role") == "candidate"
+                                                      and r.get("requested_model") == model)] + [record]
+        self.store.rewrite_transcript(entry["json"], data, self.cfg.threshold, self.cfg.run_min,
+                                      self.cfg.pause_ms, self.cfg.marker_spec)
+        agreement = (record.get("agreement") or {}).get("agreement")
+        return {**item, "status": "rejected" if record.get("error") else "candidate_read", "agreement": agreement,
+                "error": record.get("error")}
+
     def realign_memo(self, memo: Memo) -> dict:
         """Re-align the stored second reading with the current rules; no new API call."""
         item = {"id": memo.id, "short_id": memo.short_id, "title": memo.title, "recorded": memo.recorded}
@@ -1586,10 +1628,11 @@ class Worker:
     # ------------------------------------------------------------------ second reader batch
     def run_second_read(self, only: list[str] | None = None, since: str | None = None, until: str | None = None,
                         limit: int | None = None, model: str | None = None, redo: bool = False,
-                        only_uncertain: bool = False, realign: bool = False) -> dict:
+                        only_uncertain: bool = False, realign: bool = False, candidate: bool = False) -> dict:
         """Add the second reader to existing transcripts (synchronously, under the worker lock).
 
-        With ``realign`` the stored readings are aligned again with the current rules instead."""
+        With ``realign`` the stored readings are aligned again with the current rules instead;
+        with ``candidate`` ``model`` reads the memos for comparison only (see candidate_read_memo)."""
         self.store.ensure_dirs()
         try:
             with single_instance(self.store.data_dir / "worker.lock"):
@@ -1601,7 +1644,9 @@ class Worker:
                 for memo in targets:
                     if limit and sum(1 for i in items if i["status"] == "second_read") >= limit:
                         break
-                    if realign:
+                    if candidate:
+                        items.append(self.candidate_read_memo(memo, model, redo))
+                    elif realign:
                         items.append(self.realign_memo(memo))
                     else:
                         items.append(self.second_read_memo(memo, model, redo, only_uncertain))
